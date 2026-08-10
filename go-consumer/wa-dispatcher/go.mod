@@ -1,0 +1,34 @@
+module wa-dispatcher
+
+go 1.25.0
+
+require (
+	// Pinned exactly. Asynq is pre-1.0 and its public API can change without a major
+	// version bump; the worker's concurrency guarantee depends on asynq.Config semantics
+	// that a silent minor upgrade could alter.
+	github.com/hibiken/asynq v0.26.0
+	github.com/redis/go-redis/v9 v9.22.0
+	wa-shared v0.0.0
+)
+
+require (
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/pgx/v5 v5.10.0 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
+	github.com/robfig/cron/v3 v3.0.1 // indirect
+	github.com/spf13/cast v1.10.0 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
+	golang.org/x/sys v0.37.0 // indirect
+	golang.org/x/text v0.29.0 // indirect
+	golang.org/x/time v0.14.0 // indirect
+	google.golang.org/protobuf v1.36.10 // indirect
+)
+
+// Local sibling module — see ../go.work. Kept here too because `go mod tidy` does not
+// resolve workspace `use` directives; replace this with a real version once wa-shared
+// is tagged and this module is split into its own repo.
+replace wa-shared => ../wa-shared

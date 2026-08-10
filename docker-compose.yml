@@ -1,0 +1,161 @@
+name: whatsapp-api
+
+# The whole system, one stack, one command.
+#
+#   docker compose up -d --build
+#
+# Postgres and Redis are shared. Each service still owns its own database — baileys owns
+# wa_sessions/wa_sent_messages, dispatcher owns wa_jobs, console owns users/audit — they
+# just live in one server instead of three. No service reads another's tables.
+#
+# wa-console is not here on purpose: it runs on the host under `composer run dev` and
+# talks to the shared Postgres on ${POSTGRES_PORT}. See README.md.
+
+x-dispatcher-env: &dispatcher-env
+  # api and worker must be configured identically. A payload struct or a session list that
+  # differs between them is the failure this anchor exists to prevent.
+  REDIS_URL: redis://redis:6379/0
+  DATABASE_URL: postgres://dispatcher:${DISPATCHER_DB_PASSWORD}@postgres:5432/dispatcher
+  WA_SERVICE_URL: http://gateway:3000
+  WA_SERVICE_API_KEY: ${GATEWAY_DISPATCHER_KEY}
+  WA_GATEWAY_WEBHOOK_SECRET: ${WA_GATEWAY_WEBHOOK_SECRET}
+  ADMIN_API_KEY: ${DISPATCHER_ADMIN_KEY}
+  WA_SESSIONS: ${WA_SESSIONS}
+  WA_SENDERS: ${WA_SENDERS}
+  WA_DRY_RUN: ${WA_DRY_RUN:-false}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      POSTGRES_DB: postgres
+      # Read by docker/postgres/init/01-databases.sh, which runs once on an empty volume
+      # and creates one owner role and one database per service.
+      BAILEYS_DB_PASSWORD: ${BAILEYS_DB_PASSWORD}
+      DISPATCHER_DB_PASSWORD: ${DISPATCHER_DB_PASSWORD}
+      CONSOLE_DB_PASSWORD: ${CONSOLE_DB_PASSWORD}
+    ports:
+      # 5433, not 5432, so a Postgres already installed on the host keeps its port.
+      # baileys' integration tests and wa-console both point here.
+      - '${POSTGRES_PORT:-5433}:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # appendonly so a restart does not lose the slot-allocator keys and un-pace a
+    # session's whole backlog at once. Scheduled jobs live in Redis too.
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      # 6380 because an unrelated redis already holds 6379 on this machine.
+      - '${REDIS_PORT:-6380}:6379'
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    # ../baileys. Single-instance by design: two processes loading the same WhatsApp auth
+    # state corrupt it. Never set `deploy.replicas` or scale this service.
+    build:
+      context: ./baileys
+      dockerfile: ../docker/gateway.Dockerfile
+    environment:
+      DATABASE_URL: postgres://baileys:${BAILEYS_DB_PASSWORD}@postgres:5432/baileys
+      PORT: 3000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Two scoped credentials, never one. dispatcher may send and read; console may read
+      # and manage sessions but cannot send, so no operator action can bypass pacing.
+      DISPATCHER_API_KEY: ${GATEWAY_DISPATCHER_KEY}
+      CONSOLE_API_KEY: ${GATEWAY_CONSOLE_KEY}
+      # Delivery receipts. Reachable by service name now that both halves share a network,
+      # which is what makes `delivered` and `read` work at all. Unset both to turn it off.
+      WEBHOOK_URL: http://wa-consumer-api:8080/internal/gateway/events
+      WEBHOOK_SECRET: ${WA_GATEWAY_WEBHOOK_SECRET}
+      WEBHOOK_TIMEOUT_MS: ${WEBHOOK_TIMEOUT_MS:-5000}
+    ports:
+      # Loopback only. wa-console runs on the host, so the port cannot go away entirely,
+      # but nothing off this machine has any business reaching the gateway directly —
+      # dispatcher reaches it over the compose network by service name.
+      - '127.0.0.1:${GATEWAY_PORT:-3000}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # wa-consumer-api and wa-dispatcher both replace the `wa-shared` module with a local
+  # sibling directory (see ./go-consumer/go.work), so each build pulls ./wa-shared in as
+  # the named context `shared` rather than the module proxy — see docker/wa-*.Dockerfile.
+  wa-consumer-api:
+    build:
+      context: ./go-consumer/wa-consumer-api
+      dockerfile: ../../docker/wa-consumer-api.Dockerfile
+      additional_contexts:
+        shared: ./go-consumer/wa-shared
+      args:
+        VERSION: ${WA_VERSION:-dev}
+    environment: *dispatcher-env
+    ports:
+      - '${DISPATCHER_PORT:-8080}:8080'
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  wa-dispatcher:
+    build:
+      context: ./go-consumer/wa-dispatcher
+      dockerfile: ../../docker/wa-dispatcher.Dockerfile
+      additional_contexts:
+        shared: ./go-consumer/wa-shared
+    environment: *dispatcher-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+    # No `restart:` on purpose. A worker that crash-loops while holding a session's
+    # queues is exactly the failure that must stay visible.
+
+  asynqmon:
+    # Pinned, not :latest — this is the queue's only UI during development and a
+    # surprise upgrade mid-investigation is not welcome.
+    image: hibiken/asynqmon:0.7.2
+    command: ['--redis-addr=redis:6379']
+    ports:
+      # Loopback only — see the note below about it having no auth of its own.
+      - '127.0.0.1:${ASYNQMON_PORT:-8081}:8080'
+    depends_on:
+      redis:
+        condition: service_healthy
+    # No auth of its own. Keep it on localhost in development, and behind internal auth
+    # anywhere else — it can delete and archive tasks, not just display them.
+
+volumes:
+  pgdata:
+  redisdata:
