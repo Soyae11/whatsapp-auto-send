@@ -3,6 +3,8 @@ import { createPool, type Pool } from '../db.js'
 import { createLogger } from '../logger.js'
 import {
   createSession,
+  deleteSession,
+  getSession,
   listRestorableSessions,
   setSessionConnected,
   setSessionStatus,
@@ -70,5 +72,36 @@ suite('listRestorableSessions', () => {
     await setSessionConnected(pool, id, '6287713848500')
     const row = (await listRestorableSessions(pool)).find((r) => r.id === id)
     expect(row).toMatchObject({ status: 'connected', phone_number: '6287713848500' })
+  })
+})
+
+suite('deleteSession', () => {
+  const logger = createLogger('silent')
+  let pool: Pool
+
+  beforeAll(async () => {
+    pool = createPool(url!, logger)
+  })
+
+  afterAll(async () => {
+    await pool.query("DELETE FROM wa_sessions WHERE label LIKE 'delete test%'")
+    await pool.end()
+  })
+
+  it('removes the row and cascades to its auth rows', async () => {
+    const row = await createSession(pool, 'delete test cascade')
+    await pool.query("INSERT INTO wa_auth_creds (session_id, creds) VALUES ($1, '{}'::jsonb)", [
+      row.id,
+    ])
+
+    await deleteSession(pool, row.id)
+
+    expect(await getSession(pool, row.id)).toBeUndefined()
+    const creds = await pool.query('SELECT 1 FROM wa_auth_creds WHERE session_id = $1', [row.id])
+    expect(creds.rowCount).toBe(0)
+  })
+
+  it('is a no-op for an unknown id', async () => {
+    await expect(deleteSession(pool, '00000000-0000-0000-0000-000000000000')).resolves.not.toThrow()
   })
 })

@@ -59,8 +59,14 @@ type Config struct {
 
 	RateLimitWindow time.Duration
 
+	// PoolBusyDelay is how backed-up a sender pool's main session has to be, estimated,
+	// before load spreading starts sharing new sends across the rest of the pool.
+	PoolBusyDelay time.Duration
+
 	redisOpt *redis.Options
 }
+
+const DefaultPoolBusyDelay = 60 * time.Second
 
 func (c *Config) RedisOptions() *redis.Options {
 	o := *c.redisOpt
@@ -240,6 +246,10 @@ func Load() (*Config, error) {
 	}
 
 	if c.RateLimitWindow, err = durationOr("RATE_LIMIT_WINDOW", ratelimit.DefaultWindow); err != nil {
+		fail("%v", err)
+	}
+
+	if c.PoolBusyDelay, err = durationOr("WA_POOL_BUSY_DELAY", DefaultPoolBusyDelay); err != nil {
 		fail("%v", err)
 	}
 

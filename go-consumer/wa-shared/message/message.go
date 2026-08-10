@@ -59,6 +59,16 @@ type Message struct {
 	LastError       *Error            `json:"last_error,omitempty"`
 	Timestamps      Timestamps        `json:"timestamps"`
 	CreatedAt       time.Time         `json:"created_at"`
+
+	// FailoverOf and RetriedBy are public ids, not idempotency keys, for consistency with
+	// every other message reference in this API. wa_jobs.failover_of stores the *original's
+	// idempotency key* (it's the FK target — public_id has only a partial unique index, since
+	// it's null until the API layer assigns one, so it can't be one). Translating that into a
+	// public id — and finding any message that points back at this one — both need a second
+	// query, so FromRow leaves them unset; only the single-message read path (never the list,
+	// to avoid an N+1) resolves and fills them in.
+	FailoverOf string `json:"failover_of,omitempty"`
+	RetriedBy  string `json:"retried_by,omitempty"`
 }
 
 // Status maps one internal row to the public vocabulary. This is the load-bearing table, and

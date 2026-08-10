@@ -10,7 +10,13 @@ const (
 	FailureSenderLoggedOut = "sender_logged_out"
 	FailureRateLimited     = "rate_limited_by_whatsapp"
 	FailureSendFailed      = "send_failed"
+	FailureMessageRejected = "message_rejected"
 )
+
+// messageRejectedCode is what wa-gateway's webhook sends when WhatsApp accepts a message and
+// then rejects it — after the job was already marked `sent`. Unlike the codes below this one
+// never goes through the wa dispatch client, so it is not in the `wa` package.
+const messageRejectedCode = "message_rejected"
 
 // FailureCode maps a stored wa-gateway error code to the public vocabulary. Anything
 // unrecognised becomes send_failed, which is the honest summary of "we tried and stopped".
@@ -22,6 +28,8 @@ func FailureCode(stored string) string {
 		return FailureSenderLoggedOut
 	case wa.CodeRateLimitedByWA:
 		return FailureRateLimited
+	case messageRejectedCode:
+		return FailureMessageRejected
 	default:
 		return FailureSendFailed
 	}
@@ -38,6 +46,10 @@ func FailureDetail(stored, to string) string {
 		return "The sender was unlinked from WhatsApp mid-flight. A human has to re-pair it; resend afterwards under a new idempotency key."
 	case FailureRateLimited:
 		return "WhatsApp pushed back on this sender and the retries ran out. Reduce this sender's volume before resending."
+	case FailureMessageRejected:
+		return "WhatsApp accepted this message and then rejected it — most often a first message to " + to +
+			" without the privacy token an established chat carries. Have " + to +
+			" message this sender first, or send from a number with prior history with them, then resend under a new idempotency key."
 	default:
 		return "The send was attempted and did not succeed before the retries ran out. Safe to resend under a new idempotency key."
 	}

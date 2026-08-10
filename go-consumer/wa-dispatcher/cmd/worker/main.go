@@ -13,7 +13,9 @@ import (
 
 	"wa-shared/circuit"
 	"wa-shared/config"
+	"wa-shared/dispatch"
 	"wa-shared/logging"
+	"wa-shared/slots"
 	"wa-shared/store"
 	"wa-shared/wa"
 	"wa-shared/notify"
@@ -80,9 +82,23 @@ func run() error {
 	emitter := notify.NewEmitter(jobs, log)
 	deliverer := notify.NewDeliverer(jobs, log)
 
+	// The worker otherwise only ever consumes; this is the one path where it also produces —
+	// a pool failover's immediate resend via a backup session (see internal/worker/handler.go,
+	// failoverPooled). Nil coalescer: coalescing merges sends to the same recipient within a
+	// window, which isn't a concern a failover resend has.
+	allocator, err := slots.New(rdb, cfg.Slots)
+	if err != nil {
+		return err
+	}
+	asynqClient := asynq.NewClient(cfg.AsynqRedisOpt())
+	defer func() { _ = asynqClient.Close() }()
+	enqueuer := dispatch.New(asynqClient, inspector, allocator, nil, jobs, log)
+
 	handler := worker.NewHandler(waClient, jobs, log,
 		worker.WithBreaker(breaker),
 		worker.WithEmitter(emitter),
+		worker.WithPools(jobs),
+		worker.WithEnqueuer(enqueuer),
 	)
 
 	supervisor, err := worker.NewSupervisor(cfg.Sessions, cfg.AsynqRedisOpt(), handler, worker.Options{

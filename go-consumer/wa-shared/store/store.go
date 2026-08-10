@@ -63,6 +63,10 @@ type Job struct {
 
 	// WAMessageID is set by the worker on a successful send. Receipts arrive keyed on it.
 	WAMessageID string
+
+	// FailoverOf is set when this job is a pool failover's fresh send, covering for a message
+	// that failed via a different session — see wa_sender_pools. Empty for an ordinary send.
+	FailoverOf string
 }
 
 type Row struct {
@@ -90,6 +94,7 @@ type Row struct {
 	CancelledAt    *time.Time
 	FailedAt       *time.Time
 	WAMessageID    string
+	FailoverOf     *string
 }
 
 type Attempt struct {
@@ -156,11 +161,12 @@ func (s *Store) MarkScheduled(ctx context.Context, j Job, scheduledFor time.Time
 	}
 	_, err = s.pool.Exec(ctx, `
 		INSERT INTO wa_jobs (idempotency_key, session_id, to_number, source_ref, status, scheduled_for,
-		                     public_id, api_key_id, sender, priority, metadata)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		                     public_id, api_key_id, sender, priority, metadata, failover_of)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (idempotency_key) DO NOTHING`,
 		j.IdempotencyKey, j.SessionID, j.To, nullable(j.SourceRef), StatusScheduled, scheduledFor,
-		nullable(j.PublicID), nullable(j.APIKeyID), nullable(j.Sender), nullable(j.Priority), metadata)
+		nullable(j.PublicID), nullable(j.APIKeyID), nullable(j.Sender), nullable(j.Priority), metadata,
+		nullable(j.FailoverOf))
 	if err != nil {
 		return fmt.Errorf("store: mark scheduled %s: %w", j.IdempotencyKey, err)
 	}
@@ -310,7 +316,7 @@ func (s *Store) MarkCancelled(ctx context.Context, idempotencyKey string) error 
 const jobColumns = `id, idempotency_key, session_id, to_number, source_ref, status, attempts,
 	       scheduled_for, last_error_code, last_error_at, sent_at, created_at, coalesced_refs,
 	       public_id, api_key_id, sender, priority, metadata,
-	       sending_at, delivered_at, read_at, cancelled_at, failed_at, wa_message_id`
+	       sending_at, delivered_at, read_at, cancelled_at, failed_at, wa_message_id, failover_of`
 
 func scanJob(sc interface{ Scan(...any) error }) (*Row, error) {
 	var r Row
@@ -319,7 +325,7 @@ func scanJob(sc interface{ Scan(...any) error }) (*Row, error) {
 	if err := sc.Scan(&r.ID, &r.IdempotencyKey, &r.SessionID, &r.To, &sourceRef, &r.Status, &r.Attempts,
 		&r.ScheduledFor, &r.LastErrorCode, &r.LastErrorAt, &r.SentAt, &r.CreatedAt, &r.CoalescedRefs,
 		&publicID, &apiKeyID, &sender, &priority, &metadata,
-		&r.SendingAt, &r.DeliveredAt, &r.ReadAt, &r.CancelledAt, &r.FailedAt, &waMessageID); err != nil {
+		&r.SendingAt, &r.DeliveredAt, &r.ReadAt, &r.CancelledAt, &r.FailedAt, &waMessageID, &r.FailoverOf); err != nil {
 		return nil, err
 	}
 	for dst, src := range map[*string]*string{

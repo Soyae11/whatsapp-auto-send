@@ -19,9 +19,10 @@ import (
 )
 
 // Receipts is the half of the gateway contract this service consumes: wa-gateway posts
-// message.status events, and they are the only source of delivered and read.
+// message.status events, and they are the only source of delivered, read, and a post-sent
+// failure.
 type Receipts interface {
-	ApplyReceipt(ctx context.Context, waMessageID string, kind store.Receipt, at time.Time) (bool, *store.Row, error)
+	ApplyReceipt(ctx context.Context, waMessageID string, kind store.Receipt, at time.Time, errorCode string) (bool, *store.Row, error)
 }
 
 type Emitter interface {
@@ -37,6 +38,7 @@ type gatewayEvent struct {
 	Status    string  `json:"status"`
 	Timestamp *int64  `json:"timestamp"`
 	At        *string `json:"at"`
+	ErrorCode *string `json:"errorCode"`
 }
 
 const gatewayStatusEvent = "message.status"
@@ -75,7 +77,12 @@ func (s *Server) handleGatewayEvent(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, 10*time.Second)
 	defer cancel()
 
-	changed, row, err := s.receipts.ApplyReceipt(ctx, ev.MessageID, kind, receiptTime(ev))
+	errorCode := ""
+	if ev.ErrorCode != nil {
+		errorCode = *ev.ErrorCode
+	}
+
+	changed, row, err := s.receipts.ApplyReceipt(ctx, ev.MessageID, kind, receiptTime(ev), errorCode)
 	if errors.Is(err, store.ErrNotFound) {
 		// A receipt for a message this dispatcher never sent. Normal when a session is
 		// shared, and nothing to do about it.
@@ -97,6 +104,14 @@ func (s *Server) handleGatewayEvent(w http.ResponseWriter, r *http.Request) {
 		s.emitter.EmitForRow(ctx, *row)
 	}
 
+	// A rejection is exactly the case `sent` was a lie about — it means the session that sent
+	// this message just failed, so its pool (if it has one) rotates. No resend: the text isn't
+	// kept anywhere by the time a receipt arrives, only the pool moves for future sends. See
+	// the dispatcher's synchronous path for the one case that does resend.
+	if changed && kind == store.ReceiptFailed && row.Sender != "" {
+		s.rotatePoolAfterFailure(ctx, row.Sender, row.SessionID)
+	}
+
 	s.log.Info("receipt applied",
 		"wa_message_id", ev.MessageID,
 		"receipt", kind,
@@ -105,15 +120,18 @@ func (s *Server) handleGatewayEvent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"applied": changed})
 }
 
-// receiptFor maps wa-gateway's Baileys-flavoured statuses onto the two transitions consumers
-// are told about. `server_ack` is deliberately ignored: it means WhatsApp's server took the
-// message, which `sent` already covers.
+// receiptFor maps wa-gateway's Baileys-flavoured statuses onto the transitions consumers are
+// told about. `server_ack` is deliberately ignored: it means WhatsApp's server took the
+// message, which `sent` already covers. `error` is not ignored — it means the server took the
+// message and then rejected it, which is the one case `sent` is a lie about.
 func receiptFor(status string) (store.Receipt, bool) {
 	switch status {
 	case "delivery_ack":
 		return store.ReceiptDelivered, true
 	case "read", "played":
 		return store.ReceiptRead, true
+	case "error":
+		return store.ReceiptFailed, true
 	}
 	return "", false
 }

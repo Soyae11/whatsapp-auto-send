@@ -17,6 +17,7 @@ import { WA_TIMEOUTS, withTimeout } from '../wa/timeout.js'
 import { EventBus, nowIso } from './events.js'
 import { subscribeToMessageEvents } from './message-events.js'
 import {
+  deleteSession,
   getSession,
   listRestorableSessions,
   setSessionConnected,
@@ -515,6 +516,23 @@ export class SessionManager {
 
     await setSessionStatus(this.pool, id, 'logged_out')
     await clearAuthState(this.pool, id)
+  }
+
+  async delete(id: string): Promise<void> {
+    const entry = this.entries.get(id)
+    if (entry) {
+      clearTimeout(entry.reconnectTimer)
+      entry.reconnectTimer = undefined
+      entry.closing = true
+      try {
+        entry.socket?.end(undefined)
+      } catch (err) {
+        this.logger.child({ sessionId: id }).warn({ err }, 'error closing socket for delete')
+      }
+      this.entries.delete(id)
+    }
+
+    await deleteSession(this.pool, id)
   }
 
   async shutdown(): Promise<void> {

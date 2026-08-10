@@ -54,7 +54,21 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	if !s.foundMessage(w, r, err) {
 		return
 	}
-	writeJSON(w, http.StatusOK, message.FromRow(*row))
+
+	msg := message.FromRow(*row)
+
+	// Both need a second query, so only the single-message read resolves them — the list
+	// endpoint never does, to avoid an N+1.
+	if row.FailoverOf != nil {
+		if publicID, err := s.messages.FailoverOfPublicID(ctx, key.ID, *row.FailoverOf); err == nil {
+			msg.FailoverOf = publicID
+		}
+	}
+	if publicID, err := s.messages.RetriedByPublicID(ctx, key.ID, row.IdempotencyKey); err == nil {
+		msg.RetriedBy = publicID
+	}
+
+	writeJSON(w, http.StatusOK, msg)
 }
 
 func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
@@ -220,6 +234,17 @@ func (s *Server) parseMessageFilter(w http.ResponseWriter, r *http.Request) (sto
 	f := store.MessageFilter{
 		Reference: q.Get("reference"),
 		Sender:    q.Get("sender"),
+	}
+
+	if raw := q.Get("to"); raw != "" {
+		to, err := wa.NormalisePhone(raw)
+		if err != nil {
+			writeFieldProblem(w, r, CodeInvalidRequest,
+				"'to' is "+quoteOrEmpty(raw)+"; "+err.Error(),
+				[]fieldError{{Field: "to", Detail: "not a valid phone number"}})
+			return f, false
+		}
+		f.To = to
 	}
 
 	for _, raw := range q["status"] {

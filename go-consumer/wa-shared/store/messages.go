@@ -37,6 +37,45 @@ func (s *Store) GetByPublicID(ctx context.Context, apiKeyID, publicID string) (*
 	return r, nil
 }
 
+// FailoverOfPublicID resolves the public id of the message a failover retry is covering for.
+// Scoped to the same api key, mirroring GetByPublicID — a failover retry never crosses tenants,
+// this just doesn't take that on faith.
+func (s *Store) FailoverOfPublicID(ctx context.Context, apiKeyID, failoverOfKey string) (string, error) {
+	var publicID *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT public_id FROM wa_jobs WHERE idempotency_key = $1 AND api_key_id = $2`,
+		failoverOfKey, apiKeyID).Scan(&publicID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: failover-of public id for %s: %w", failoverOfKey, err)
+	}
+	if publicID == nil {
+		return "", nil
+	}
+	return *publicID, nil
+}
+
+// RetriedByPublicID finds the message, if any, that retried idempotencyKey via a different pool
+// session.
+func (s *Store) RetriedByPublicID(ctx context.Context, apiKeyID, idempotencyKey string) (string, error) {
+	var publicID *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT public_id FROM wa_jobs WHERE failover_of = $1 AND api_key_id = $2`,
+		idempotencyKey, apiKeyID).Scan(&publicID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: retried-by public id for %s: %w", idempotencyKey, err)
+	}
+	if publicID == nil {
+		return "", nil
+	}
+	return *publicID, nil
+}
+
 // GetByWAMessageID finds the job a wa-gateway receipt refers to. Receipts carry no api key,
 // so this one is deliberately unscoped — its caller is the gateway intake, not a consumer.
 func (s *Store) GetByWAMessageID(ctx context.Context, waMessageID string) (*Row, error) {
@@ -55,6 +94,7 @@ type MessageFilter struct {
 	APIKeyID  string
 	Reference string
 	Sender    string
+	To        string
 	Statuses  []Status
 	After     time.Time
 	Before    time.Time
@@ -122,6 +162,9 @@ func (s *Store) ListMessages(ctx context.Context, f MessageFilter) (rows []Row, 
 	}
 	if f.Sender != "" {
 		add("sender = $%d", f.Sender)
+	}
+	if f.To != "" {
+		add("to_number = $%d", f.To)
 	}
 	if len(f.Statuses) > 0 {
 		add("status = ANY($%d)", f.Statuses)
@@ -218,14 +261,25 @@ type Receipt string
 const (
 	ReceiptDelivered Receipt = "delivered"
 	ReceiptRead      Receipt = "read"
+
+	// ReceiptFailed is WhatsApp rejecting a message asynchronously, after wa-gateway had
+	// already returned success from /send and the job was marked `sent`. Without this, that
+	// rejection has nowhere to go: the job sits at `sent` forever, indistinguishable from a
+	// message that actually reached the device.
+	ReceiptFailed Receipt = "failed"
 )
 
-// ApplyReceipt records a delivery or read receipt and reports whether it changed anything.
+// ApplyReceipt records a delivery, read, or failure receipt and reports whether it changed
+// anything.
 //
 // Receipts are unordered, so a `read` that arrives before its `delivered` must not be undone
 // by the late one, and a repeat must not re-fire a webhook. Both are handled by only ever
 // filling a column that is still null, and by treating `read` as implying `delivered`.
-func (s *Store) ApplyReceipt(ctx context.Context, waMessageID string, kind Receipt, at time.Time) (changed bool, row *Row, err error) {
+func (s *Store) ApplyReceipt(ctx context.Context, waMessageID string, kind Receipt, at time.Time, errorCode string) (changed bool, row *Row, err error) {
+	if kind == ReceiptFailed {
+		return s.applyFailureReceipt(ctx, waMessageID, errorCode, at)
+	}
+
 	var column string
 	switch kind {
 	case ReceiptDelivered:
@@ -259,6 +313,32 @@ func (s *Store) ApplyReceipt(ctx context.Context, waMessageID string, kind Recei
 	}
 
 	// Nothing moved: either this receipt already landed, or there is no such message.
+	existing, err := s.GetByWAMessageID(ctx, waMessageID)
+	if err != nil {
+		return false, nil, err
+	}
+	return false, existing, nil
+}
+
+// applyFailureReceipt moves a `sent` job to `failed`. Unlike delivered/read this changes
+// `status` itself, not just a timestamp column, and — like every failure this dispatcher
+// records — is never retried: a message wa-gateway already reported as sent has already
+// reached WhatsApp once, and resending it is a new message, not a retry of this one.
+func (s *Store) applyFailureReceipt(ctx context.Context, waMessageID, errorCode string, at time.Time) (bool, *Row, error) {
+	r, err := scanJob(s.pool.QueryRow(ctx, `
+		UPDATE wa_jobs
+		   SET status = $2, failed_at = $3, last_error_code = $4, last_error_at = $3
+		 WHERE wa_message_id = $1
+		   AND status = $5
+		RETURNING `+jobColumns,
+		waMessageID, StatusFailed, at, nullable(errorCode), StatusSent))
+	if err == nil {
+		return true, r, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return false, nil, fmt.Errorf("store: apply failure receipt for %s: %w", waMessageID, err)
+	}
+
 	existing, err := s.GetByWAMessageID(ctx, waMessageID)
 	if err != nil {
 		return false, nil, err

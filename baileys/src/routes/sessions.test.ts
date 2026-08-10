@@ -57,6 +57,7 @@ suite('session routes', () => {
       restart: async (id: string) => snap({ id, status: 'disconnected' }),
       logout: async () => {},
       reset: async () => {},
+      delete: async () => {},
       waitForPairingReady: async () => {},
       recordSendOutcome: () => {},
       requirePairingSocket: () => ({
@@ -591,6 +592,35 @@ suite('session routes', () => {
       })
       expect(res.statusCode).toBe(200)
       expect(res.json()).toMatchObject({ id, status: 'logged_out' })
+    })
+  })
+
+  describe('DELETE /sessions/:id', () => {
+    it('calls SessionManager.delete and responds 204', async () => {
+      let deletedId: string | undefined
+      app = makeApp({ delete: async (id: string) => void (deletedId = id) })
+      const id = await createSessionVia(app, 'route test delete')
+
+      const res = await app.inject({ method: 'DELETE', url: `/sessions/${id}`, headers: auth })
+      expect(res.statusCode).toBe(204)
+      expect(deletedId).toBe(id)
+    })
+
+    it('404s an unknown session', async () => {
+      app = makeApp()
+      const res = await app.inject({
+        method: 'DELETE',
+        url: '/sessions/00000000-0000-0000-0000-000000000000',
+        headers: auth,
+      })
+      expect(res.statusCode).toBe(404)
+    })
+
+    it('requires manage, not just read', async () => {
+      app = makeApp()
+      const id = await createSessionVia(app, 'route test delete auth')
+      const res = await app.inject({ method: 'DELETE', url: `/sessions/${id}`, headers: sendAuth })
+      expect(res.statusCode).toBe(403)
     })
   })
 })

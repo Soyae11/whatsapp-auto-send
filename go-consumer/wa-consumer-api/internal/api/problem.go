@@ -24,6 +24,7 @@ const (
 	CodeRateLimited           = "rate_limited"
 	CodeQueueHorizonExceeded  = "queue_horizon_exceeded"
 	CodeSenderUnavailable     = "sender_unavailable"
+	CodeSenderPoolExhausted   = "sender_pool_exhausted"
 	CodeInternalError         = "internal_error"
 )
 
@@ -55,6 +56,7 @@ var problemKinds = map[string]problemKind{
 	CodeRateLimited:           {http.StatusTooManyRequests, "Rate limit exceeded", true},
 	CodeQueueHorizonExceeded:  {http.StatusServiceUnavailable, "Sender backlog too deep", true},
 	CodeSenderUnavailable:     {http.StatusServiceUnavailable, "Sender temporarily unavailable", true},
+	CodeSenderPoolExhausted:   {http.StatusServiceUnavailable, "Sender pool exhausted", true},
 	CodeInternalError:         {http.StatusInternalServerError, "Internal error", true},
 }
 

@@ -80,24 +80,29 @@ describe('statusName', () => {
   })
 })
 
-describe('subscribeToMessageEvents read receipts', () => {
-  function fakeSocket(): { socket: WASocket; readMessages: ReturnType<typeof vi.fn>; trigger: (payload: unknown) => void } {
-    const handlers: Record<string, (payload: never) => void> = {}
-    const readMessages = vi.fn(async () => {})
-    const socket = {
-      ev: {
-        on: (event: string, handler: (payload: never) => void) => {
-          handlers[event] = handler
-        },
+function fakeSocket(): {
+  socket: WASocket
+  readMessages: ReturnType<typeof vi.fn>
+  trigger: (event: string, payload: unknown) => void
+} {
+  const handlers: Record<string, (payload: never) => void> = {}
+  const readMessages = vi.fn(async () => {})
+  const socket = {
+    ev: {
+      on: (event: string, handler: (payload: never) => void) => {
+        handlers[event] = handler
       },
-      readMessages,
-    } as unknown as WASocket
-    return {
-      socket,
-      readMessages,
-      trigger: (payload) => handlers['messages.upsert']?.(payload as never),
-    }
+    },
+    readMessages,
+  } as unknown as WASocket
+  return {
+    socket,
+    readMessages,
+    trigger: (event, payload) => handlers[event]?.(payload as never),
   }
+}
+
+describe('subscribeToMessageEvents read receipts', () => {
 
   it('marks an inbound message read after a human-plausible pause', async () => {
     vi.useFakeTimers()
@@ -105,7 +110,7 @@ describe('subscribeToMessageEvents read receipts', () => {
       const { socket, readMessages, trigger } = fakeSocket()
       subscribeToMessageEvents(socket, 's1', new EventBus(logger), logger)
 
-      trigger({ messages: [message()], type: 'notify' })
+      trigger('messages.upsert', { messages: [message()], type: 'notify' })
       expect(readMessages).not.toHaveBeenCalled()
 
       await vi.advanceTimersByTimeAsync(4_000)
@@ -122,13 +127,59 @@ describe('subscribeToMessageEvents read receipts', () => {
       subscribeToMessageEvents(socket, 's1', new EventBus(logger), logger)
 
       const own = message({ key: { id: 'MSG-2', remoteJid: 'x@s.whatsapp.net', fromMe: true } })
-      trigger({ messages: [own], type: 'notify' })
+      trigger('messages.upsert', { messages: [own], type: 'notify' })
       await vi.advanceTimersByTimeAsync(5_000)
 
       expect(readMessages).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('subscribeToMessageEvents status updates', () => {
+  const key = { id: 'MSG-1', remoteJid: '6287713848500@s.whatsapp.net', fromMe: true }
+
+  it('reports a delivery ack with no error code', () => {
+    const { socket, trigger } = fakeSocket()
+    const bus = new EventBus(logger)
+    const seen = vi.fn()
+    bus.subscribe(seen)
+    subscribeToMessageEvents(socket, 's1', bus, logger)
+
+    trigger('messages.update', [{ key, update: { status: proto.WebMessageInfo.Status.DELIVERY_ACK } }])
+
+    expect(seen).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'message.status', status: 'delivery_ack' }),
+    )
+    expect(seen.mock.calls[0]?.[0]).not.toHaveProperty('errorCode')
+  })
+
+  it('flags an ERROR status with a stable error code, so a "sent" message that WhatsApp actually rejected does not go unreported', () => {
+    const { socket, trigger } = fakeSocket()
+    const bus = new EventBus(logger)
+    const seen = vi.fn()
+    bus.subscribe(seen)
+    subscribeToMessageEvents(socket, 's1', bus, logger)
+
+    trigger('messages.update', [{ key, update: { status: proto.WebMessageInfo.Status.ERROR } }])
+
+    expect(seen).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'message.status', status: 'error', errorCode: 'message_rejected' }),
+    )
+  })
+
+  it('ignores updates with no id or that are not this service\'s own message', () => {
+    const { socket, trigger } = fakeSocket()
+    const bus = new EventBus(logger)
+    const seen = vi.fn()
+    bus.subscribe(seen)
+    subscribeToMessageEvents(socket, 's1', bus, logger)
+
+    trigger('messages.update', [{ key: { ...key, id: null }, update: { status: proto.WebMessageInfo.Status.SERVER_ACK } }])
+    trigger('messages.update', [{ key: { ...key, fromMe: false }, update: { status: proto.WebMessageInfo.Status.SERVER_ACK } }])
+
+    expect(seen).not.toHaveBeenCalled()
   })
 })
 

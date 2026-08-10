@@ -46,6 +46,7 @@ const ROUTE_CAPABILITIES = new Map<string, Capability>([
   ['POST /sessions/:id/restart', 'manage'],
   ['POST /sessions/:id/reset', 'manage'],
   ['POST /sessions/:id/logout', 'manage'],
+  ['DELETE /sessions/:id', 'manage'],
 ])
 
 function tokensMatch(a: string, b: string): boolean {

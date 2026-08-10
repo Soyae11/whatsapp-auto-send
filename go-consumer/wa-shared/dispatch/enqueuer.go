@@ -39,6 +39,10 @@ type SendRequest struct {
 	PublicID string
 	Sender   string
 	Metadata map[string]string
+
+	// FailoverOf links this send back to the message it's covering for, when it exists
+	// because a pool failed over to a different session. Empty for an ordinary send.
+	FailoverOf string
 }
 
 type Result struct {
@@ -200,6 +204,7 @@ func (e *Enqueuer) Enqueue(ctx context.Context, req SendRequest) (*Result, error
 		Sender:         req.Sender,
 		Priority:       string(priority),
 		Metadata:       req.Metadata,
+		FailoverOf:     req.FailoverOf,
 	}
 
 	if err := e.jobs.MarkScheduled(ctx, job, processAt); err != nil {
@@ -216,6 +221,7 @@ func (e *Enqueuer) Enqueue(ctx context.Context, req SendRequest) (*Result, error
 		Priority:       string(priority),
 		EnqueuedAt:     time.Now().UTC(),
 		SourceRef:      req.SourceRef,
+		Sender:         req.Sender,
 	})
 	if err != nil {
 		e.markUnqueued(ctx, job, err)

@@ -89,6 +89,7 @@ export function subscribeToMessageEvents(
     for (const { key, update } of updates) {
       if (!key.id || update.status === undefined || update.status === null) continue
       if (!key.fromMe) continue
+      const isError = update.status === proto.WebMessageInfo.Status.ERROR
       events.emit({
         type: 'message.status',
         sessionId,
@@ -96,6 +97,9 @@ export function subscribeToMessageEvents(
         messageId: key.id,
         to: key.remoteJid ?? '',
         status: statusName(update.status),
+        // WhatsApp's own reason (e.g. "463", a missing-privacy-token rejection) never makes
+        // it further than this log; a consumer only needs to know the send did not land.
+        ...(isError ? { errorCode: 'message_rejected' } : {}),
       })
     }
   })

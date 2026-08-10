@@ -53,6 +53,10 @@ export async function listRestorableSessions(pool: Pool): Promise<SessionRow[]> 
   return rows
 }
 
+export async function deleteSession(pool: Pool, id: string): Promise<void> {
+  await pool.query('DELETE FROM wa_sessions WHERE id = $1', [id])
+}
+
 export async function setSessionStatus(
   pool: Pool,
   id: string,

@@ -156,3 +156,33 @@ CREATE TABLE IF NOT EXISTS wa_job_attempts (
   at               TIMESTAMPTZ NOT NULL,
   UNIQUE (idempotency_key, attempt)
 );
+
+-- A failover retry is a brand-new message (new idempotency key, new row) rather than a mutation
+-- of the one that failed — see wa_sender_pools below for why. This just links the two for
+-- display; it carries no behaviour of its own.
+ALTER TABLE wa_jobs ADD COLUMN IF NOT EXISTS failover_of TEXT REFERENCES wa_jobs (idempotency_key);
+
+-- A sender with no rows here behaves exactly as it does today: one static session, resolved
+-- from WA_SENDERS, no extra query. Rows only exist for senders an operator has deliberately
+-- pooled.
+--
+-- disqualified is a *sticky* mark, distinct from is_main=false. Every member starts as a
+-- normal, promotable backup; only ever having failed while it was main earns this mark, and
+-- once marked it is excluded from auto-promotion until a human clears it (Reinstate) — a
+-- backup that's never been tried is still trusted, a session that broke while serving is not.
+--
+-- At most one main per sender is enforced by the partial unique index below, not by
+-- application code: two processes racing a promotion can't both "win".
+CREATE TABLE IF NOT EXISTS wa_sender_pools (
+  sender        TEXT NOT NULL,
+  session_id    TEXT NOT NULL,
+  is_main       BOOLEAN NOT NULL DEFAULT false,
+  disqualified  BOOLEAN NOT NULL DEFAULT false,
+  rank          INT NOT NULL DEFAULT 0,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (sender, session_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS wa_sender_pools_main_idx ON wa_sender_pools (sender)
+  WHERE is_main;

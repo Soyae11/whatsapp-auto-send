@@ -28,6 +28,12 @@ export type SessionEvent =
       messageId: string
       to: string
       status: string
+      /**
+       * Only set when status is 'error': WhatsApp rejected the message after it was already
+       * handed off, so the HTTP response to /send had already reported success. This is the
+       * only channel a consumer has for finding out that a "sent" message never landed.
+       */
+      errorCode?: string
     }
 
 export type SessionEventType = SessionEvent['type']

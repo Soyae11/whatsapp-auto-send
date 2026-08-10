@@ -188,6 +188,13 @@ export function registerSessionRoutes(app: AppInstance, deps: SessionRouteDeps):
     return { id, status: 'logged_out' }
   })
 
+  app.delete('/sessions/:id', async (req, reply) => {
+    const { id } = parse(idParams, req.params)
+    await loadSession(id)
+    await sessions.delete(id)
+    return reply.code(204).send()
+  })
+
   app.post('/sessions/:id/send', async (req, reply) => {
     const { id } = parse(idParams, req.params)
     const body = parse(sendBody, req.body)

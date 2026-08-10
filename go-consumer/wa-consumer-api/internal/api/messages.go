@@ -243,6 +243,21 @@ func (s *Server) planSend(w http.ResponseWriter, r *http.Request, req sendFields
 		return sendPlan{}, false
 	}
 
+	sender, err := s.resolveSendSession(r.Context(), sender)
+	if err != nil {
+		if errors.Is(err, errSenderPoolExhausted) {
+			writeProblem(w, r, CodeSenderPoolExhausted, "Sender "+quoteOrEmpty(sender.Name)+
+				" has no session currently eligible to send: every session in its pool has "+
+				"failed and been disqualified. A human has to reinstate one on the Pools page "+
+				"before this sender can send again — queueing would only delay the same failure.")
+			return sendPlan{}, false
+		}
+		s.log.Error("could not resolve a session for sender",
+			"request_id", requestIDFrom(r.Context()), "sender", sender.Name, "error", err)
+		writeProblem(w, r, CodeInternalError, "The message could not be queued. It is safe to retry.")
+		return sendPlan{}, false
+	}
+
 	priority := sender.DefaultPriority
 	if req.Priority != "" {
 		p, err := tasks.ParsePriority(req.Priority)
@@ -265,6 +280,10 @@ func (s *Server) planSend(w http.ResponseWriter, r *http.Request, req sendFields
 		return sendPlan{}, false
 	}
 
+	if !dryRun && !s.senderCanSend(w, r, &sender) {
+		return sendPlan{}, false
+	}
+
 	plan := sendPlan{
 		fields:    req,
 		sender:    sender,
@@ -280,10 +299,6 @@ func (s *Server) planSend(w http.ResponseWriter, r *http.Request, req sendFields
 		return sendPlan{}, false
 	}
 	plan.to = to
-
-	if !dryRun && !s.senderCanSend(w, r, sender) {
-		return sendPlan{}, false
-	}
 
 	plan.publicID = id.New(messageIDPrefix)
 	if dryRun {
@@ -485,7 +500,13 @@ func (s *Server) dryRunRequested(w http.ResponseWriter, r *http.Request, sender 
 // senderCanSend refuses only the case where queueing cannot help: a logged-out sender needs a
 // human to re-pair it. A reconnecting or briefly disconnected sender still returns 202,
 // because the message waits in the queue and goes out on recovery.
-func (s *Server) senderCanSend(w http.ResponseWriter, r *http.Request, sender senders.Sender) bool {
+//
+// A logged-out session is itself a failure signal — for a pooled sender it is treated exactly
+// like a failed send would be (see rotatePoolAfterFailure and the dispatcher's synchronous
+// path): this discovers the failure proactively, before ever queueing, rather than reactively
+// after a doomed send attempt. On a successful rotation, sender.SessionID is updated in place
+// so the caller's plan uses the newly promoted session.
+func (s *Server) senderCanSend(w http.ResponseWriter, r *http.Request, sender *senders.Sender) bool {
 	if s.sessions == nil {
 		return true
 	}
@@ -501,6 +522,21 @@ func (s *Server) senderCanSend(w http.ResponseWriter, r *http.Request, sender se
 	}
 	if view != wa.StatusLoggedOut {
 		return true
+	}
+
+	if s.pools != nil {
+		promotedTo, err := s.pools.Rotate(ctx, sender.Name, sender.SessionID, s.isCircuitOpen(ctx))
+		if err != nil {
+			s.log.Error("could not rotate pool for a logged-out sender",
+				"request_id", requestIDFrom(r.Context()), "sender", sender.Name, "error", err)
+		} else if promotedTo != "" {
+			s.log.Warn("sender logged out at send time, pool rotated",
+				"alert", true,
+				"request_id", requestIDFrom(r.Context()),
+				"sender", sender.Name, "session_id", sender.SessionID, "promoted_to", promotedTo)
+			sender.SessionID = promotedTo
+			return true
+		}
 	}
 
 	s.log.Warn("send refused, sender is logged out",

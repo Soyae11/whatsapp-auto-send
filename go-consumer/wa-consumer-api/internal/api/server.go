@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"wa-shared/auth"
 	"wa-shared/circuit"
 	"wa-shared/dispatch"
@@ -41,12 +43,28 @@ type MessageStore interface {
 	GetByPublicID(ctx context.Context, apiKeyID, publicID string) (*store.Row, error)
 	ListMessages(ctx context.Context, f store.MessageFilter) ([]store.Row, bool, error)
 	CancelByPublicID(ctx context.Context, apiKeyID, publicID string, at time.Time) (*store.Row, error)
+	FailoverOfPublicID(ctx context.Context, apiKeyID, failoverOfKey string) (string, error)
+	RetriedByPublicID(ctx context.Context, apiKeyID, idempotencyKey string) (string, error)
 }
 
 type IdempotencyStore interface {
 	ClaimIdempotencyKey(ctx context.Context, apiKeyID, key, requestHash string) (*store.IdempotentResponse, error)
 	RecordIdempotentResponse(ctx context.Context, apiKeyID, key string, statusCode int, body []byte) error
 	ReleaseIdempotencyKey(ctx context.Context, apiKeyID, key string) error
+}
+
+// Pools is a sender's main/backup session pool — see wa_sender_pools. A sender with no pool
+// rows is unaffected by any of this; pools are opt-in.
+type Pools interface {
+	Pool(ctx context.Context, sender string) ([]store.PoolMember, error)
+	CreatePool(ctx context.Context, sender string, sessionIDs []string) error
+	DeletePool(ctx context.Context, sender string) error
+	Promote(ctx context.Context, sender, newMainSessionID string) error
+	Disqualify(ctx context.Context, sender, sessionID string) error
+	Reinstate(ctx context.Context, sender, sessionID string) error
+	AddMember(ctx context.Context, sender, sessionID string) error
+	RemoveMember(ctx context.Context, sender, sessionID string) error
+	Rotate(ctx context.Context, sender, failedSessionID string, isOpen func(sessionID string) bool) (promotedTo string, err error)
 }
 
 type RateLimiter interface {
@@ -70,10 +88,16 @@ type Options struct {
 	Sessions    SessionStatusSource
 	Webhooks    WebhookStore
 	Receipts    Receipts
+	Pools       Pools
 	Emitter     Emitter
 	Horizon     time.Duration
 	AdminKey    string
 	Version     string
+
+	// PoolBusyDelay is how backed-up a pool's main session's estimated wait has to be before
+	// load spreading kicks in and starts sharing new sends across the rest of the pool. Zero
+	// uses a sane default — see WA_POOL_BUSY_DELAY.
+	PoolBusyDelay time.Duration
 
 	// Redis is load-bearing for a send and Database is not, so an unreachable Redis is
 	// reported as `down` with a 503 while an unreachable Postgres is only `degraded`.
@@ -87,6 +111,11 @@ type Options struct {
 	// AllowedOrigins is an exact-match CORS allowlist for browser callers. Empty (the
 	// default) sends no Access-Control-* headers at all — see withCORS in middleware.go.
 	AllowedOrigins []string
+
+	// Redis is the shared client backing pool load-spreading's round-robin counter — the
+	// same connection info already used for slots/coalescing/circuit state, kept separate
+	// from the Redis field above (a health probe, not a real client).
+	RedisClient redis.Cmdable
 
 	Log *slog.Logger
 }
@@ -104,6 +133,9 @@ type Server struct {
 	sessions       SessionStatusSource
 	webhooks       WebhookStore
 	receipts       Receipts
+	pools          Pools
+	poolBusyDelay  time.Duration
+	rdb            redis.Cmdable
 	emitter        Emitter
 	horizon        time.Duration
 	adminKey       string
@@ -115,10 +147,18 @@ type Server struct {
 	log            *slog.Logger
 }
 
+// DefaultPoolBusyDelay is how backed-up a pool's main session has to be, estimated, before load
+// spreading starts sharing new sends across the rest of the pool.
+const DefaultPoolBusyDelay = 60 * time.Second
+
 func New(o Options) *Server {
 	horizon := o.Horizon
 	if horizon <= 0 {
 		horizon = slots.DefaultConfig().Horizon
+	}
+	poolBusyDelay := o.PoolBusyDelay
+	if poolBusyDelay <= 0 {
+		poolBusyDelay = DefaultPoolBusyDelay
 	}
 	return &Server{
 		enqueuer:       o.Enqueuer,
@@ -133,6 +173,9 @@ func New(o Options) *Server {
 		sessions:       o.Sessions,
 		webhooks:       o.Webhooks,
 		receipts:       o.Receipts,
+		pools:          o.Pools,
+		poolBusyDelay:  poolBusyDelay,
+		rdb:            o.RedisClient,
 		emitter:        o.Emitter,
 		horizon:        horizon,
 		adminKey:       o.AdminKey,
@@ -217,6 +260,13 @@ func (s *Server) operatorRoutes() *http.ServeMux {
 	operator.HandleFunc("GET /internal/sessions/{id}/circuit", s.handleCircuitState)
 	operator.HandleFunc("POST /internal/sessions/{id}/pause", s.handlePause)
 	operator.HandleFunc("POST /internal/sessions/{id}/resume", s.handleResume)
+	operator.HandleFunc("GET /internal/senders/{name}/pool", s.handleGetPool)
+	operator.HandleFunc("POST /internal/senders/{name}/pool", s.handleCreatePool)
+	operator.HandleFunc("DELETE /internal/senders/{name}/pool", s.handleDeletePool)
+	operator.HandleFunc("POST /internal/senders/{name}/pool/members", s.handleAddPoolMember)
+	operator.HandleFunc("DELETE /internal/senders/{name}/pool/members/{sessionId}", s.handleRemovePoolMember)
+	operator.HandleFunc("POST /internal/senders/{name}/pool/promote", s.handlePromotePoolMember)
+	operator.HandleFunc("POST /internal/senders/{name}/pool/members/{sessionId}/reinstate", s.handleReinstatePoolMember)
 
 	return operator
 }

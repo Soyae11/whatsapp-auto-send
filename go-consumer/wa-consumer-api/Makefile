@@ -1,10 +1,14 @@
-.PHONY: build vet test up down logs
+.PHONY: build vet test up down logs create-key
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X 'main.version=$(VERSION)'
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o bin/api ./cmd/api
+
+# Usage: make create-key NAME=wa-console PROJECT=internal SENDERS=farhan-business,farhan-real
+create-key:
+	go run ./cmd/keys -name "$(NAME)" -project "$(PROJECT)" -senders "$(SENDERS)" -env "$(or $(ENV),test)"
 
 vet:
 	go vet ./...

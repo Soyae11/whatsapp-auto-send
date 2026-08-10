@@ -1,0 +1,115 @@
+package api
+
+import (
+	"context"
+	"errors"
+
+	"wa-shared/senders"
+)
+
+// errSenderPoolExhausted means the sender has a pool but no member currently qualifies as
+// main — every session has failed while serving and been disqualified. The caller must reject
+// the send outright, never fall back to anything.
+var errSenderPoolExhausted = errors.New("api: sender pool exhausted")
+
+// resolveSendSession overrides sender.SessionID with its pool's current session, when it has
+// one. A sender with no pool rows is returned unchanged — this is the common case, and costs
+// nothing beyond the one Pool lookup.
+//
+// Load spreading (batch sends and a busy queue are the same signal — see pools.go's package
+// comment) lives here too: once main's estimated wait crosses poolBusyDelay, new sends share
+// the pool by simple round robin across every member that is neither disqualified nor
+// circuit-open, main included — it is still useful capacity, just no longer exclusive. This
+// never changes who is main; that only happens on an actual send failure (see the dispatcher
+// and receipts.go).
+func (s *Server) resolveSendSession(ctx context.Context, sender senders.Sender) (senders.Sender, error) {
+	if s.pools == nil {
+		return sender, nil
+	}
+
+	members, err := s.pools.Pool(ctx, sender.Name)
+	if err != nil {
+		return sender, err
+	}
+	if len(members) == 0 {
+		return sender, nil
+	}
+
+	var main string
+	for _, m := range members {
+		if m.IsMain {
+			main = m.SessionID
+			break
+		}
+	}
+	if main == "" {
+		return sender, errSenderPoolExhausted
+	}
+
+	// Uncertain or comfortably short: use main. Spreading only kicks in once we've *confirmed*
+	// it is backed up past the threshold — never on a guess.
+	if depth, err := s.enqueuer.Depth(ctx, main); err != nil || depth < s.poolBusyDelay {
+		sender.SessionID = main
+		return sender, nil
+	}
+
+	isOpen := s.isCircuitOpen(ctx)
+	eligible := make([]string, 0, len(members))
+	for _, m := range members {
+		if m.Disqualified || isOpen(m.SessionID) {
+			continue
+		}
+		eligible = append(eligible, m.SessionID)
+	}
+	if len(eligible) == 0 {
+		sender.SessionID = main
+		return sender, nil
+	}
+
+	n, err := s.nextRoundRobin(ctx, sender.Name, len(eligible))
+	if err != nil {
+		sender.SessionID = main
+		return sender, nil
+	}
+	sender.SessionID = eligible[n]
+	return sender, nil
+}
+
+// rotatePoolAfterFailure reacts to a session that just failed serving sender. This is the async
+// path (a post-sent rejection) — it can only ever rotate, never resend the rejected message
+// itself (its text is long gone by the time a receipt arrives). See the dispatcher's
+// synchronous path for the one case that does resend.
+func (s *Server) rotatePoolAfterFailure(ctx context.Context, sender, failedSessionID string) {
+	if s.pools == nil {
+		return
+	}
+	if _, err := s.pools.Rotate(ctx, sender, failedSessionID, s.isCircuitOpen(ctx)); err != nil {
+		s.log.Error("could not rotate pool after a send failure",
+			"sender", sender, "session_id", failedSessionID, "error", err)
+	}
+}
+
+// isCircuitOpen adapts the circuit breaker to PickHealthyBackup's isOpen callback shape.
+func (s *Server) isCircuitOpen(ctx context.Context) func(sessionID string) bool {
+	return func(sessionID string) bool {
+		if s.circuit == nil {
+			return false
+		}
+		state, err := s.circuit.State(ctx, sessionID)
+		return err == nil && state.Open
+	}
+}
+
+// nextRoundRobin advances a per-sender counter shared across every wa-consumer-api process
+// (Redis, not process memory — matching how circuit/slots/coalescing state already work), and
+// returns an index into a candidate list of length n.
+func (s *Server) nextRoundRobin(ctx context.Context, sender string, n int) (int, error) {
+	if s.rdb == nil || n <= 0 {
+		return 0, errors.New("round robin unavailable")
+	}
+	v, err := s.rdb.Incr(ctx, "wa:pool:rr:"+sender).Result()
+	if err != nil {
+		return 0, err
+	}
+	return int((v - 1) % int64(n)), nil
+}

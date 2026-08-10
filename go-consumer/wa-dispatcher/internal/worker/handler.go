@@ -9,6 +9,9 @@ import (
 
 	"github.com/hibiken/asynq"
 
+	"wa-shared/circuit"
+	"wa-shared/dispatch"
+	"wa-shared/id"
 	"wa-shared/store"
 	"wa-shared/tasks"
 	"wa-shared/wa"
@@ -43,19 +46,44 @@ func (NopEmitter) EmitForRow(context.Context, store.Row) {}
 type CircuitBreaker interface {
 	Success(ctx context.Context, sessionID string) error
 	Failure(ctx context.Context, sessionID, errorCode string) (opened bool, err error)
+	State(ctx context.Context, sessionID string) (circuit.State, error)
 }
 
 type NopBreaker struct{}
 
 func (NopBreaker) Success(context.Context, string) error                 { return nil }
 func (NopBreaker) Failure(context.Context, string, string) (bool, error) { return false, nil }
+func (NopBreaker) State(context.Context, string) (circuit.State, error)  { return circuit.State{}, nil }
+
+// Pools is a sender's main/backup session pool — see wa-shared/store/pools.go. A sender with no
+// pool rows is unaffected by any of this.
+type Pools interface {
+	Pool(ctx context.Context, sender string) ([]store.PoolMember, error)
+	Rotate(ctx context.Context, sender, failedSessionID string, isOpen func(sessionID string) bool) (promotedTo string, err error)
+}
+
+type NopPools struct{}
+
+func (NopPools) Pool(context.Context, string) ([]store.PoolMember, error) { return nil, nil }
+func (NopPools) Rotate(context.Context, string, string, func(string) bool) (string, error) {
+	return "", nil
+}
+
+// Enqueuer is the one thing a failover resend needs from wa-shared/dispatch — a fresh send
+// under a new idempotency key, exactly as any other send is made. wa-dispatcher otherwise only
+// ever consumes; this is the one path where it also produces.
+type Enqueuer interface {
+	Enqueue(ctx context.Context, req dispatch.SendRequest) (*dispatch.Result, error)
+}
 
 type Handler struct {
-	wa      *wa.Client
-	jobs    Recorder
-	circuit CircuitBreaker
-	events  Emitter
-	log     *slog.Logger
+	wa       *wa.Client
+	jobs     Recorder
+	circuit  CircuitBreaker
+	events   Emitter
+	pools    Pools
+	enqueuer Enqueuer
+	log      *slog.Logger
 }
 
 type HandlerOption func(*Handler)
@@ -76,11 +104,29 @@ func WithEmitter(e Emitter) HandlerOption {
 	}
 }
 
+func WithPools(p Pools) HandlerOption {
+	return func(h *Handler) {
+		if p != nil {
+			h.pools = p
+		}
+	}
+}
+
+func WithEnqueuer(e Enqueuer) HandlerOption {
+	return func(h *Handler) {
+		if e != nil {
+			h.enqueuer = e
+		}
+	}
+}
+
 func NewHandler(client *wa.Client, jobs Recorder, log *slog.Logger, opts ...HandlerOption) *Handler {
 	if jobs == nil {
 		jobs = NopRecorder{}
 	}
-	h := &Handler{wa: client, jobs: jobs, circuit: NopBreaker{}, events: NopEmitter{}, log: log}
+	h := &Handler{
+		wa: client, jobs: jobs, circuit: NopBreaker{}, events: NopEmitter{}, pools: NopPools{}, log: log,
+	}
 	for _, o := range opts {
 		o(h)
 	}
@@ -143,7 +189,7 @@ func (h *Handler) ProcessTask(ctx context.Context, t *asynq.Task) error {
 	elapsed := time.Since(start)
 
 	if sendErr != nil {
-		return h.recordFailure(ctx, log, job, sendErr, elapsed, lastAttempt)
+		return h.recordFailure(ctx, log, job, p, sendErr, elapsed, lastAttempt)
 	}
 
 	job.WAMessageID = derefOr(res.WAMessageID, "")
@@ -170,16 +216,25 @@ func (h *Handler) recordFailure(
 	ctx context.Context,
 	log *slog.Logger,
 	job store.Job,
+	p tasks.SendMessagePayload,
 	sendErr error,
 	elapsed time.Duration,
 	lastAttempt bool,
 ) error {
 	code := wa.ErrorCode(sendErr)
 	v := Classify(sendErr)
-	permanent := !v.Retryable || lastAttempt
 
 	recCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
+
+	// A pooled sender's failures are handled entirely here, on the very first one — not after
+	// the normal same-session retry/backoff runs out. An unpooled sender (no pool rows at all)
+	// falls straight through to that unchanged, exactly as it always has.
+	if h.failoverPooled(recCtx, log, job, p, code, v) {
+		return fmt.Errorf("%w: %w", sendErr, asynq.SkipRetry)
+	}
+
+	permanent := !v.Retryable || lastAttempt
 	if err := h.jobs.MarkFailed(recCtx, job, code, permanent, time.Now()); err != nil {
 		log.Error("could not record failure", "error", err)
 	}
@@ -218,6 +273,113 @@ func (h *Handler) recordFailure(
 	default:
 		log.Warn("send failed, will retry", append(attrs, "backoff_base", v.Backoff.Base.String())...)
 		return sendErr
+	}
+}
+
+// failoverPooled handles a failure end to end for a sender with a pool: it always records the
+// original attempt as a permanent failure (job.SessionID has already proven unfit for this
+// message — retrying it on the same session is not on the table once a pool exists), rotates
+// the pool (wa-shared/store.Store.Rotate — promotes a healthy backup if job.SessionID was main,
+// or just disqualifies it alone if it was a load-spread backup with main untouched), and — the
+// one thing this synchronous path can do that the async rejection path in wa-consumer-api
+// cannot — resends the same message through whichever session Rotate found, because the text
+// is still sitting right here in p, not gone the way it is by the time a receipt arrives.
+//
+// Reports whether it handled the failure at all. false (no pool for this sender) means the
+// caller proceeds exactly as it always has.
+func (h *Handler) failoverPooled(
+	ctx context.Context,
+	log *slog.Logger,
+	job store.Job,
+	p tasks.SendMessagePayload,
+	code string,
+	v Verdict,
+) bool {
+	if p.Sender == "" {
+		return false
+	}
+
+	members, err := h.pools.Pool(ctx, p.Sender)
+	if err != nil {
+		log.Error("could not read pool after a send failure", "sender", p.Sender, "error", err)
+		return false
+	}
+	if len(members) == 0 {
+		return false
+	}
+
+	if err := h.jobs.MarkFailed(ctx, job, code, true, time.Now()); err != nil {
+		log.Error("could not record failure", "error", err)
+	}
+	h.announce(ctx, job.IdempotencyKey)
+	if v.TripsCircuit {
+		if _, err := h.circuit.Failure(ctx, job.SessionID, code); err != nil {
+			log.Error("could not record the failure against the circuit", "error", err)
+		}
+	}
+
+	backup, err := h.pools.Rotate(ctx, p.Sender, p.SessionID, h.isCircuitOpen(ctx))
+	if err != nil {
+		log.Error("could not rotate pool after a send failure", "sender", p.Sender, "error", err)
+		return true
+	}
+	if backup == "" {
+		log.Error("pool has no session eligible to take over", "alert", true, "sender", p.Sender, "error_code", code)
+		return true
+	}
+
+	h.resendViaBackup(ctx, log, p, backup)
+	return true
+}
+
+// resendViaBackup sends p's text again through a different session, as a brand-new message —
+// new idempotency key, new public id — linked back to the one that failed via FailoverOf,
+// exactly like every other "resend after a failure" in this system rather than a mutation of
+// the row that failed. APIKeyID and Metadata aren't in the task payload (kept lean; see
+// tasks.SendMessagePayload), so this reads them back from the original job row.
+func (h *Handler) resendViaBackup(ctx context.Context, log *slog.Logger, p tasks.SendMessagePayload, backup string) {
+	if h.enqueuer == nil {
+		log.Error("no enqueuer configured, cannot resend via backup", "backup", backup)
+		return
+	}
+
+	original, err := h.jobs.Get(ctx, p.IdempotencyKey)
+	if err != nil || original == nil {
+		log.Error("could not read the original job to resend it", "error", err)
+		return
+	}
+
+	priority, err := tasks.ParsePriority(p.Priority)
+	if err != nil {
+		priority = tasks.PriorityDefault
+	}
+
+	newKey := p.IdempotencyKey + "-fo-" + id.Random("", 6)
+	_, err = h.enqueuer.Enqueue(ctx, dispatch.SendRequest{
+		SessionID:      backup,
+		To:             p.To,
+		Text:           p.Text,
+		Priority:       priority,
+		SourceRef:      p.SourceRef,
+		IdempotencyKey: newKey,
+		APIKeyID:       original.APIKeyID,
+		PublicID:       id.New("msg"),
+		Sender:         p.Sender,
+		Metadata:       original.Metadata,
+		FailoverOf:     p.IdempotencyKey,
+	})
+	if err != nil {
+		log.Error("could not resend via backup session", "backup", backup, "error", err)
+		return
+	}
+	log.Warn("failed over to backup session", "alert", true, "backup", backup, "new_idempotency_key", newKey)
+}
+
+// isCircuitOpen adapts the circuit breaker to Rotate's isOpen callback shape.
+func (h *Handler) isCircuitOpen(ctx context.Context) func(sessionID string) bool {
+	return func(sessionID string) bool {
+		state, err := h.circuit.State(ctx, sessionID)
+		return err == nil && state.Open
 	}
 }
 

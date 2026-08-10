@@ -23,6 +23,10 @@ type SendMessagePayload struct {
 	Priority       string    `json:"priority"`
 	EnqueuedAt     time.Time `json:"enqueued_at"`
 	SourceRef      string    `json:"source_ref"`
+
+	// Sender is the pool this session belongs to, if any. The worker needs it on failure to
+	// look up backups — see wa_sender_pools.
+	Sender string `json:"sender,omitempty"`
 }
 
 type Priority string
