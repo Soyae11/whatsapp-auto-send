@@ -8,6 +8,7 @@ enum FailureCode: string
     case SenderLoggedOut = 'sender_logged_out';
     case RateLimitedByWhatsApp = 'rate_limited_by_whatsapp';
     case SendFailed = 'send_failed';
+    case MessageRejected = 'message_rejected';
     case Unknown = 'unknown';
 
     public static function parse(?string $value): self
@@ -17,6 +18,6 @@ enum FailureCode: string
 
     public function worthResending(): bool
     {
-        return $this !== self::NotOnWhatsApp;
+        return ! in_array($this, [self::NotOnWhatsApp, self::MessageRejected], true);
     }
 }

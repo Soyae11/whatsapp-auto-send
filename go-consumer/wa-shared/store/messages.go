@@ -93,13 +93,18 @@ func (s *Store) GetByWAMessageID(ctx context.Context, waMessageID string) (*Row,
 type MessageFilter struct {
 	APIKeyID  string
 	Reference string
-	Sender    string
-	To        string
-	Statuses  []Status
-	After     time.Time
-	Before    time.Time
-	Limit     int
-	Cursor    Cursor
+	// Sender narrows to exactly one sender. Senders, if non-empty, takes priority and
+	// narrows to any of several — the "show me only my own senders' messages" case wa-console
+	// needs once one API key's history can span more than one owner. Both exist because most
+	// callers only ever need one.
+	Sender   string
+	Senders  []string
+	To       string
+	Statuses []Status
+	After    time.Time
+	Before   time.Time
+	Limit    int
+	Cursor   Cursor
 }
 
 // Cursor points at the last row of the previous page. Keying on (created_at, id) rather than
@@ -160,7 +165,10 @@ func (s *Store) ListMessages(ctx context.Context, f MessageFilter) (rows []Row, 
 		where = append(where, fmt.Sprintf(
 			"(source_ref = $%d OR $%d = ANY(COALESCE(coalesced_refs, '{}'::TEXT[])))", len(args), len(args)))
 	}
-	if f.Sender != "" {
+	switch {
+	case len(f.Senders) > 0:
+		add("sender = ANY($%d)", f.Senders)
+	case f.Sender != "":
 		add("sender = $%d", f.Sender)
 	}
 	if f.To != "" {

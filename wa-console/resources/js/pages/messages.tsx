@@ -13,8 +13,10 @@ import {
     SelectTrigger,
     SelectValue,
 } from '@/components/ui/select';
+import { sessionLabel } from '@/lib/session-label';
 import { messages as messagesRoute } from '@/routes';
 import type { Message, MessageFilters, MessageStatus } from '@/types/message';
+import type { PoolSession } from '@/types/pool';
 import type { SenderOption } from '@/types/send';
 
 const STATUS_VARIANT: Record<
@@ -48,12 +50,14 @@ export default function Messages({
     nextCursor,
     filters,
     senders,
+    sessions,
 }: {
     messages: Message[];
     hasMore: boolean;
     nextCursor: string | null;
     filters: MessageFilters;
     senders: SenderOption[];
+    sessions: PoolSession[];
 }) {
     const [sender, setSender] = useState(filters.sender ?? ANY);
     const [to, setTo] = useState(filters.to ?? '');
@@ -208,6 +212,9 @@ export default function Messages({
                                                 Sender
                                             </th>
                                             <th className="p-2 font-medium">
+                                                Sent from
+                                            </th>
+                                            <th className="p-2 font-medium">
                                                 Status
                                             </th>
                                             <th className="p-2 font-medium">
@@ -229,6 +236,14 @@ export default function Messages({
                                                 </td>
                                                 <td className="p-2">
                                                     {message.sender}
+                                                </td>
+                                                <td className="p-2">
+                                                    {message.session_id
+                                                        ? sessionLabel(
+                                                              sessions,
+                                                              message.session_id,
+                                                          )
+                                                        : '—'}
                                                 </td>
                                                 <td className="p-2">
                                                     <Badge
@@ -268,6 +283,7 @@ export default function Messages({
                 <MessageDetailDialog
                     key={selectedId}
                     id={selectedId}
+                    sessions={sessions}
                     open={selectedId !== null}
                     onOpenChange={(open) => {
                         if (!open) {

@@ -207,6 +207,32 @@ func (s *Store) RevokeAPIKeyByOwner(ctx context.Context, id, ownerID string) (*a
 	return key, false, nil
 }
 
+// GrantKeySender adds sender to id's permitted senders list, if it isn't already there.
+// Idempotent — safe to call every time a sender is created, not just the first time.
+func (s *Store) GrantKeySender(ctx context.Context, id, sender string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE wa_api_keys
+		   SET senders = array_append(senders, $2)
+		 WHERE id = $1 AND NOT ($2 = ANY(senders))`, id, sender)
+	if err != nil {
+		return fmt.Errorf("store: grant sender %q to key %s: %w", sender, id, err)
+	}
+	return nil
+}
+
+// RevokeKeySender is GrantKeySender's inverse, run when a sender is deleted so a stale grant
+// doesn't linger on a key that can no longer resolve it to anything.
+func (s *Store) RevokeKeySender(ctx context.Context, id, sender string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE wa_api_keys
+		   SET senders = array_remove(senders, $2)
+		 WHERE id = $1`, id, sender)
+	if err != nil {
+		return fmt.Errorf("store: revoke sender %q from key %s: %w", sender, id, err)
+	}
+	return nil
+}
+
 func (s *Store) RevokeAPIKey(ctx context.Context, id string) (*auth.Key, bool, error) {
 	key, err := scanKey(s.pool.QueryRow(ctx, `
 		UPDATE wa_api_keys

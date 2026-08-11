@@ -3,6 +3,7 @@ import { store } from '@/actions/App/Http/Controllers/SendController';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Label } from '@/components/ui/label';
 import {
     Select,
@@ -27,11 +28,14 @@ export default function Send({
         sender: senders[0]?.name ?? '',
         numbers: '',
         message: '',
+        critical: false,
     });
 
     function submit(event: React.FormEvent) {
         event.preventDefault();
-        post(store.url(), { onSuccess: () => reset('numbers', 'message') });
+        post(store.url(), {
+            onSuccess: () => reset('numbers', 'message', 'critical'),
+        });
     }
 
     return (
@@ -148,6 +152,28 @@ export default function Send({
                                         </p>
                                     )}
                                 </div>
+
+                                <label className="flex items-center gap-2 text-sm">
+                                    <Checkbox
+                                        checked={data.critical}
+                                        onCheckedChange={(checked) =>
+                                            setData('critical', checked === true)
+                                        }
+                                    />
+                                    Critical
+                                </label>
+                                <p className="-mt-2 text-sm text-muted-foreground">
+                                    Sends as soon as pacing allows instead of
+                                    waiting behind the normal queue. Reserve
+                                    this for messages that are actually
+                                    time-sensitive — everything critical still
+                                    competes for the same WhatsApp number.
+                                </p>
+                                {errors.critical && (
+                                    <p className="text-sm text-destructive">
+                                        {errors.critical}
+                                    </p>
+                                )}
 
                                 <Button
                                     type="submit"

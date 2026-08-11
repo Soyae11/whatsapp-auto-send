@@ -48,6 +48,7 @@ type Message struct {
 	ID              string            `json:"id"`
 	Status          string            `json:"status"`
 	Sender          string            `json:"sender"`
+	SessionID       string            `json:"session_id"`
 	To              string            `json:"to"`
 	Type            string            `json:"type"`
 	Priority        string            `json:"priority"`
@@ -116,6 +117,7 @@ func FromRow(r store.Row) Message {
 		ID:        r.PublicID,
 		Status:    Status(r),
 		Sender:    r.Sender,
+		SessionID: r.SessionID,
 		To:        r.To,
 		Type:      tasks.MessageTypeText,
 		Priority:  r.Priority,

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"wa-shared/auth"
@@ -22,8 +23,8 @@ type messageList struct {
 }
 
 type senderView struct {
-	Name                  string `json:"name"`
-	Mode                  string `json:"mode"`
+	Name string `json:"name"`
+	Mode string `json:"mode"`
 	// OwnerID is metadata only — it grants nothing by itself, key.MaySend already gates
 	// whether this key may use the sender at all. wa-console uses it to show each of its
 	// users only their own senders on the Send and Pools pages.
@@ -295,7 +296,23 @@ func (s *Server) parseMessageFilter(w http.ResponseWriter, r *http.Request) (sto
 	q := r.URL.Query()
 	f := store.MessageFilter{
 		Reference: q.Get("reference"),
-		Sender:    q.Get("sender"),
+	}
+
+	// A comma-separated "sender" value means "any of these" — wa-console uses this to scope
+	// a user's message history to every sender they own, since one API key's messages can
+	// span more than one owner. A single value with no comma behaves exactly as before.
+	if raw := q.Get("sender"); raw != "" {
+		var senders []string
+		for _, name := range strings.Split(raw, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				senders = append(senders, name)
+			}
+		}
+		if len(senders) == 1 {
+			f.Sender = senders[0]
+		} else {
+			f.Senders = senders
+		}
 	}
 
 	if raw := q.Get("to"); raw != "" {

@@ -6,6 +6,7 @@ use App\Http\Controllers\Concerns\ListsSenders;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
+use Illuminate\Validation\Rule;
 use Inertia\Inertia;
 use Inertia\Response;
 use Wa\Laravel\Contracts\WaClient;
@@ -26,10 +27,18 @@ class SendController extends Controller
 
     public function store(Request $request): RedirectResponse
     {
+        // senderOptions() is already filtered to the current user's own senders (see
+        // ListsSenders) — Rule::in against it is what actually stops a POST naming another
+        // user's sender, not just hiding it from the dropdown. wa-console's shared WA_KEY
+        // would happily authorise the send otherwise, since Go only checks the key's own
+        // sender grant, not who owns the sender.
+        $ownedSenders = array_column($this->senderOptions(), 'name');
+
         $data = $request->validate([
-            'sender' => ['required', 'string'],
+            'sender' => ['required', 'string', Rule::in($ownedSenders)],
             'numbers' => ['required', 'string'],
             'message' => ['required', 'string', 'max:65536'],
+            'critical' => ['sometimes', 'boolean'],
         ]);
 
         $numbers = collect(preg_split('/[\r\n,]+/', $data['numbers']))
@@ -42,10 +51,16 @@ class SendController extends Controller
             return back()->withErrors(['numbers' => 'Enter at least one number.']);
         }
 
-        $pending = $numbers->map(fn (string $number) => $this->wa->to($number)
-            ->from($data['sender'])
-            ->text($data['message'])
-            ->key((string) Str::uuid()));
+        $critical = $data['critical'] ?? false;
+
+        $pending = $numbers->map(function (string $number) use ($data, $critical) {
+            $message = $this->wa->to($number)
+                ->from($data['sender'])
+                ->text($data['message'])
+                ->key((string) Str::uuid());
+
+            return $critical ? $message->critical() : $message;
+        });
 
         $result = $this->wa->sendMany($pending);
 

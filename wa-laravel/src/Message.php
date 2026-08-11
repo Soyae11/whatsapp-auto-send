@@ -12,6 +12,7 @@ final readonly class Message
         public Status $status,
         public string $sender,
         public string $to,
+        public string $type,
         public string $priority,
         public bool $dryRun,
         public int $attempts,
@@ -21,6 +22,8 @@ final readonly class Message
         public ?MessageError $lastError,
         public array $timestamps,
         public ?DateTimeImmutable $createdAt,
+        public ?string $failoverOf,
+        public ?string $retriedBy,
         public bool $replayed,
         public array $raw,
     ) {}
@@ -32,6 +35,7 @@ final readonly class Message
             status: Status::parse($data['status'] ?? null),
             sender: (string) ($data['sender'] ?? ''),
             to: (string) ($data['to'] ?? ''),
+            type: (string) ($data['type'] ?? 'text'),
             priority: (string) ($data['priority'] ?? 'default'),
             dryRun: (bool) ($data['dry_run'] ?? false),
             attempts: (int) ($data['attempts'] ?? 0),
@@ -41,6 +45,8 @@ final readonly class Message
             lastError: isset($data['last_error']) ? MessageError::fromArray($data['last_error']) : null,
             timestamps: $data['timestamps'] ?? [],
             createdAt: self::time($data['created_at'] ?? null),
+            failoverOf: $data['failover_of'] ?? null,
+            retriedBy: $data['retried_by'] ?? null,
             replayed: $replayed,
             raw: $data,
         );

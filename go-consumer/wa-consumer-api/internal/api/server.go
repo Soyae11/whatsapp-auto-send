@@ -40,6 +40,8 @@ type KeyStore interface {
 	CreateAPIKey(ctx context.Context, in store.APIKeyInput) (*auth.Key, auth.Secret, error)
 	ListAPIKeysByOwner(ctx context.Context, ownerID string) ([]auth.Key, error)
 	RevokeAPIKeyByOwner(ctx context.Context, id, ownerID string) (*auth.Key, bool, error)
+	GrantKeySender(ctx context.Context, id, sender string) error
+	RevokeKeySender(ctx context.Context, id, sender string) error
 }
 
 // SenderStore is the wa_senders table — see wa-shared/store/senders.go. Distinct from Pools:
@@ -107,7 +109,10 @@ type Options struct {
 	Emitter     Emitter
 	Horizon     time.Duration
 	AdminKey    string
-	Version     string
+	// ConsoleKeyID is wa-console's own sending key id — see config.Config.ConsoleKeyID. Empty
+	// disables the auto-grant/revoke on sender create/delete.
+	ConsoleKeyID string
+	Version      string
 
 	// PoolBusyDelay is how backed-up a pool's main session's estimated wait has to be before
 	// load spreading kicks in and starts sharing new sends across the rest of the pool. Zero
@@ -155,6 +160,7 @@ type Server struct {
 	emitter        Emitter
 	horizon        time.Duration
 	adminKey       string
+	consoleKeyID   string
 	version        string
 	redis          Probe
 	database       Probe
@@ -196,6 +202,7 @@ func New(o Options) *Server {
 		emitter:        o.Emitter,
 		horizon:        horizon,
 		adminKey:       o.AdminKey,
+		consoleKeyID:   o.ConsoleKeyID,
 		version:        o.Version,
 		redis:          o.Redis,
 		database:       o.Database,

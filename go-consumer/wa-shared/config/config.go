@@ -30,6 +30,16 @@ type Config struct {
 
 	AdminAPIKey string
 
+	// ConsoleKeyID is the wa_api_keys.id of wa-console's own shared sending key (the one its
+	// WA_KEY resolves to). When set, creating or deleting a sender through /internal/senders
+	// also grants/revokes it on this key — otherwise a sender a user just created through
+	// wa-console's own Senders page would be invisible to wa-console's Send/Pools pages,
+	// since /v1/senders only ever returns what the calling key is granted, and self-service
+	// sender creation has no other way to update that grant. Optional: leaving it unset just
+	// means an operator has to run `cmd/keys -rotate` (or an UPDATE) by hand, same as before
+	// this existed.
+	ConsoleKeyID string
+
 	// GatewayWebhookSecret is wa-gateway's WEBHOOK_SECRET, used to verify the receipts it
 	// posts to us. Empty means the receipt endpoint refuses everything, so delivered and
 	// read simply never arrive — which is a degradation, not a failure.
@@ -101,6 +111,7 @@ func Load() (*Config, error) {
 
 		GatewayWebhookSecret: os.Getenv("WA_GATEWAY_WEBHOOK_SECRET"),
 		AdminAPIKey:          os.Getenv("ADMIN_API_KEY"),
+		ConsoleKeyID:         strings.TrimSpace(os.Getenv("WA_CONSOLE_KEY_ID")),
 		APIAddr:              envOr("API_ADDR", ":8080"),
 		LogLevel:             strings.ToLower(envOr("LOG_LEVEL", "info")),
 	}
@@ -185,6 +196,9 @@ func Load() (*Config, error) {
 		fail("%v", err)
 	}
 	if c.Slots.TTL, err = durationOr("SLOT_TTL", c.Slots.TTL); err != nil {
+		fail("%v", err)
+	}
+	if c.Slots.CriticalGap, err = durationOr("SLOT_CRITICAL_GAP", c.Slots.CriticalGap); err != nil {
 		fail("%v", err)
 	}
 	if err := c.Slots.Validate(); err != nil && len(problems) == 0 {

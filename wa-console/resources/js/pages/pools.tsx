@@ -19,21 +19,10 @@ import {
     SelectTrigger,
     SelectValue,
 } from '@/components/ui/select';
+import { sessionLabel } from '@/lib/session-label';
 import { pools as poolsRoute } from '@/routes';
 import type { PoolMember, PoolSession } from '@/types/pool';
 import type { SenderOption } from '@/types/send';
-
-function sessionLabel(sessions: PoolSession[], id: string): string {
-    const session = sessions.find((s) => s.id === id);
-
-    if (!session) {
-        return id;
-    }
-
-    return session.phoneNumber
-        ? `${session.label} (${session.phoneNumber})`
-        : session.label;
-}
 
 function MemberBadge({ member }: { member: PoolMember }) {
     if (member.is_main) {

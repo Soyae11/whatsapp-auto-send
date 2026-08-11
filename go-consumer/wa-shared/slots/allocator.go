@@ -25,6 +25,14 @@ type Config struct {
 	Horizon time.Duration
 
 	TTL time.Duration
+
+	// CriticalGap is the minimum spacing used for expedited (critical-lane) sends instead
+	// of Gap. It paces critical sends only against each other, never against the ordinary
+	// lattice — anchoring it to the next ordinary slot at all, even loosely, drags a
+	// "near-term" critical send out to nearly a full Gap away once there's a backlog. It's a
+	// short floor, not no floor: still enough that a burst of critical sends fans out
+	// instead of landing on one instant.
+	CriticalGap time.Duration
 }
 
 func DefaultConfig() Config {
@@ -39,6 +47,10 @@ func DefaultConfig() Config {
 		MaxSpread: 170 * time.Second,
 		Horizon:   6 * time.Hour,
 		TTL:       7 * time.Hour,
+
+		// Short enough that a critical alert doesn't sit behind a backlog, long enough that
+		// a burst of them still looks like separate human sends rather than one instant.
+		CriticalGap: 30 * time.Second,
 	}
 }
 
@@ -56,6 +68,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("slot horizon (%s) must exceed gap (%s)", c.Horizon, c.Gap)
 	case c.TTL <= c.Horizon:
 		return fmt.Errorf("slot ttl (%s) must exceed horizon (%s), or a deep backlog loses its slot key", c.TTL, c.Horizon)
+	case c.CriticalGap <= 0:
+		return errors.New("slot critical gap must be positive")
+	case c.CriticalGap > c.Gap:
+		return fmt.Errorf("slot critical gap (%s) must not exceed gap (%s), or critical is slower than ordinary traffic", c.CriticalGap, c.Gap)
 	}
 	return nil
 }
@@ -134,6 +150,7 @@ func (a *Allocator) Next(ctx context.Context, sessionID string, expedite bool) (
 		a.cfg.Horizon.Milliseconds(),
 		a.cfg.TTL.Milliseconds(),
 		expediteArg,
+		a.cfg.CriticalGap.Milliseconds(),
 	).Slice()
 	if err != nil {
 		return time.Time{}, false, fmt.Errorf("slots: allocate for session %s: %w", sessionID, err)
@@ -171,7 +188,7 @@ func (a *Allocator) Next(ctx context.Context, sessionID string, expedite bool) (
 func (a *Allocator) applyJitter(slot, now time.Time, expedited bool) time.Time {
 	low, high := a.cfg.MinSpread-a.cfg.Gap, a.cfg.MaxSpread-a.cfg.Gap
 	if expedited {
-		bound := a.cfg.Gap / 4
+		bound := a.cfg.CriticalGap / 4
 		low = max(low, -bound)
 		high = min(high, bound)
 	}

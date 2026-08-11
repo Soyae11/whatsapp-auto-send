@@ -108,6 +108,7 @@ func (s *Server) handleCreateSender(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("sender created", "name", row.Name, "mode", row.Mode, "owner_id", row.OwnerID)
+	s.grantConsoleSender(ctx, row.Name)
 	s.refreshSenders(ctx)
 	writeJSON(w, http.StatusCreated, senderRowView(*row))
 }
@@ -128,8 +129,33 @@ func (s *Server) handleDeleteSender(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Warn("sender deleted", "alert", true, "name", name, "owner_id", ownerID)
+	s.revokeConsoleSender(ctx, name)
 	s.refreshSenders(ctx)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// grantConsoleSender and revokeConsoleSender keep wa-console's own sending key's grant list in
+// sync with what wa_senders actually has — otherwise /v1/senders (which wa-console's Send and
+// Pools pages read from) would never show a sender a user just self-service-created, since that
+// endpoint only ever returns what the calling key is explicitly permitted to use. Both are
+// best-effort: a failure here is logged, not surfaced to the caller — the sender itself was
+// already created/deleted successfully, and cmd/keys can still fix the grant by hand.
+func (s *Server) grantConsoleSender(ctx context.Context, name string) {
+	if s.consoleKeyID == "" {
+		return
+	}
+	if err := s.keys.GrantKeySender(ctx, s.consoleKeyID, name); err != nil {
+		s.log.Warn("could not grant sender to console key", "sender", name, "error", err)
+	}
+}
+
+func (s *Server) revokeConsoleSender(ctx context.Context, name string) {
+	if s.consoleKeyID == "" {
+		return
+	}
+	if err := s.keys.RevokeKeySender(ctx, s.consoleKeyID, name); err != nil {
+		s.log.Warn("could not revoke sender from console key", "sender", name, "error", err)
+	}
 }
 
 // refreshSenders swaps in a fresh registry snapshot right after an admin mutation, so the

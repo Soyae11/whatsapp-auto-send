@@ -28,6 +28,7 @@ export type Message = {
     id: string;
     status: MessageStatus;
     sender: string;
+    session_id?: string;
     to: string;
     type: string;
     priority: string;

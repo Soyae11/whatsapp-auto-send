@@ -7,21 +7,23 @@
 --
 -- KEYS[1] = wa:slot:{sessionID}         tail: the last allocated slot, epoch ms
 -- KEYS[2] = wa:slot:{sessionID}:head    the last slot handed to an expedited job, epoch ms
--- ARGV[1] = now       epoch ms, supplied by the caller
--- ARGV[2] = gap       ms between slots
--- ARGV[3] = horizon   ms; refuse to allocate further out than this
--- ARGV[4] = ttl       ms to keep both keys alive
+-- ARGV[1] = now          epoch ms, supplied by the caller
+-- ARGV[2] = gap          ms between ordinary slots
+-- ARGV[3] = horizon      ms; refuse to allocate further out than this
+-- ARGV[4] = ttl          ms to keep both keys alive
 -- ARGV[5] = '1' to expedite (critical lane), anything else to append
+-- ARGV[6] = criticalGap  ms minimum spacing used for expedited sends instead of `gap`
 --
 -- Returns { slot_ms, rejected, expedited } as three strings. Strings rather than integers
 -- because a Lua number is a double and epoch-millisecond values deserve no rounding
 -- surprises.
 
-local now      = tonumber(ARGV[1])
-local gap      = tonumber(ARGV[2])
-local horizon  = tonumber(ARGV[3])
-local ttl      = tonumber(ARGV[4])
-local expedite = ARGV[5] == '1'
+local now       = tonumber(ARGV[1])
+local gap       = tonumber(ARGV[2])
+local horizon   = tonumber(ARGV[3])
+local ttl       = tonumber(ARGV[4])
+local expedite  = ARGV[5] == '1'
+local criticalGap = tonumber(ARGV[6])
 
 local tail = tonumber(redis.call('GET', KEYS[1]) or '0')
 
@@ -32,36 +34,30 @@ if tail > base then
 end
 local append = base + gap
 
--- Every appended slot sits on a lattice anchored at the tail with spacing exactly `gap`, so
--- the earliest send still ahead of us is `tail - floor((tail-now)/gap) * gap`. An expedited
--- job takes the midpoint of the interval that follows it. That is the best any insertion
--- into a saturated schedule can do: it splits one interval into two halves of `gap/2` and
--- leaves every other interval untouched, so no two sends ever land closer than half a gap.
--- Placing it at the front of the interval instead would collide head-on with a job already
--- enqueued at that instant, and `Concurrency: 1` would then emit both back to back.
---
--- `head` spaces expedited jobs from each other, so a flood of critical messages interleaves
--- into successive midpoints rather than stacking on one.
-if expedite and tail > now then
-  local ahead = math.floor((tail - now) / gap)
-  local front = tail - ahead * gap
-  local slot  = front + math.floor(gap / 2)
-
+-- An expedited job is paced by `criticalGap` against the last expedited send (`head`) only —
+-- deliberately NOT against the ordinary lattice (`tail`/`gap`) at all. Anchoring it to the
+-- next ordinary slot, even loosely, means a saturated backlog drags a "near-term" critical
+-- send out to nearly a full `gap` away, which defeats the entire point of a separate lane.
+-- `head` still keeps a burst of critical messages fanned out by `criticalGap` instead of
+-- stacking on one instant; `Concurrency: 1` is what actually serialises both lanes onto the
+-- session's real send timeline, so this is a shorter minimum spacing, not no spacing at all.
+if expedite then
   local head = tonumber(redis.call('GET', KEYS[2]) or '0')
-  if head + gap > slot then
-    slot = head + gap
+
+  local slot = now
+  if head + criticalGap > slot then
+    slot = head + criticalGap
   end
 
-  if slot < append then
-    -- The horizon is deliberately not consulted here. It exists to reject bulk that has
-    -- backed up beyond usefulness; refusing an OTP because marketing filled the queue is
-    -- exactly the failure this phase removes. The expedited slot is near-term by
-    -- construction, and the tail still moves out, so the session's total capacity is
-    -- unchanged and ordinary traffic is what gets rejected once it saturates.
-    redis.call('SET', KEYS[1], tostring(append), 'PX', ttl)
-    redis.call('SET', KEYS[2], tostring(slot), 'PX', ttl)
-    return { tostring(slot), '0', '1' }
-  end
+  -- The horizon is deliberately not consulted here. It exists to reject bulk that has
+  -- backed up beyond usefulness; refusing an OTP because marketing filled the queue is
+  -- exactly the failure this phase removes. The expedited slot is near-term by
+  -- construction, and the tail still moves out by a full ordinary `gap`, so the session's
+  -- total capacity is unchanged and ordinary traffic is what gets rejected once it
+  -- saturates — a flood of "critical" sends cannot be used to dodge that budget.
+  redis.call('SET', KEYS[1], tostring(append), 'PX', ttl)
+  redis.call('SET', KEYS[2], tostring(slot), 'PX', ttl)
+  return { tostring(slot), '0', '1' }
 end
 
 -- A backlog deeper than the horizon means something upstream is wrong. Reject rather

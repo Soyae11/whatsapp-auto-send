@@ -10,7 +10,9 @@ import {
 } from '@/components/ui/dialog';
 import { Spinner } from '@/components/ui/spinner';
 import { apiFetch } from '@/lib/http';
+import { sessionLabel } from '@/lib/session-label';
 import type { Message, MessageStatus } from '@/types/message';
+import type { PoolSession } from '@/types/pool';
 
 const STATUS_VARIANT: Record<
     MessageStatus,
@@ -37,10 +39,12 @@ const TIMELINE_STEPS: { key: keyof Message['timestamps']; label: string }[] = [
 
 export function MessageDetailDialog({
     id,
+    sessions,
     open,
     onOpenChange,
 }: {
     id: string;
+    sessions: PoolSession[];
     open: boolean;
     onOpenChange: (open: boolean) => void;
 }) {
@@ -112,6 +116,18 @@ export function MessageDetailDialog({
                                 Sender
                             </span>
                             <span>{message.sender}</span>
+
+                            <span className="text-muted-foreground">
+                                Session
+                            </span>
+                            <span>
+                                {message.session_id
+                                    ? sessionLabel(
+                                          sessions,
+                                          message.session_id,
+                                      )
+                                    : '—'}
+                            </span>
 
                             <span className="text-muted-foreground">
                                 Priority

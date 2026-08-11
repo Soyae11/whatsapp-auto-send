@@ -155,6 +155,7 @@ func run() error {
 		Emitter:        notify.NewEmitter(jobs, log),
 		Horizon:        cfg.Slots.Horizon,
 		AdminKey:       cfg.AdminAPIKey,
+		ConsoleKeyID:   cfg.ConsoleKeyID,
 		Version:        version,
 		Redis:          func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
 		Database:       jobs.Ping,
