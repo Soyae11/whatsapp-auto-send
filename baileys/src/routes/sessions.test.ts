@@ -17,6 +17,11 @@ const SEND_KEY = 'k'.repeat(32)
 const auth = { authorization: `Bearer ${API_KEY}` }
 const sendAuth = { authorization: `Bearer ${SEND_KEY}` }
 
+// Every "manage" route now requires wa-console to assert which of its own users a call is on
+// behalf of — see routes/sessions.ts. These tests only care that ownership plumbing works, not
+// about testing multiple distinct owners, so one constant stands in for "wa-console's caller".
+const TEST_OWNER = 'route-test-owner'
+
 function snap(overrides: Partial<SessionSnapshot> & { id: string }): SessionSnapshot {
   return {
     status: 'connected',
@@ -73,7 +78,12 @@ suite('session routes', () => {
   }
 
   async function createSessionVia(app: AppInstance, label = 'route test'): Promise<string> {
-    const res = await app.inject({ method: 'POST', url: '/sessions', headers: auth, payload: { label } })
+    const res = await app.inject({
+      method: 'POST',
+      url: '/sessions',
+      headers: auth,
+      payload: { label, ownerId: TEST_OWNER },
+    })
     expect(res.statusCode).toBe(201)
     return res.json().id
   }
@@ -100,7 +110,7 @@ suite('session routes', () => {
         method: 'POST',
         url: '/sessions',
         headers: auth,
-        payload: { label: 'route test create' },
+        payload: { label: 'route test create', ownerId: TEST_OWNER },
       })
       expect(res.statusCode).toBe(201)
       expect(res.json()).toMatchObject({ label: 'route test create', status: 'new', hasQr: false })
@@ -109,7 +119,24 @@ suite('session routes', () => {
 
     it('rejects a missing label with the error contract', async () => {
       app = makeApp()
-      const res = await app.inject({ method: 'POST', url: '/sessions', headers: auth, payload: {} })
+      const res = await app.inject({
+        method: 'POST',
+        url: '/sessions',
+        headers: auth,
+        payload: { ownerId: TEST_OWNER },
+      })
+      expect(res.statusCode).toBe(400)
+      expect(res.json()).toMatchObject({ error_code: 'invalid_payload', retryable: false })
+    })
+
+    it('rejects a missing ownerId with the error contract', async () => {
+      app = makeApp()
+      const res = await app.inject({
+        method: 'POST',
+        url: '/sessions',
+        headers: auth,
+        payload: { label: 'route test no owner' },
+      })
       expect(res.statusCode).toBe(400)
       expect(res.json()).toMatchObject({ error_code: 'invalid_payload', retryable: false })
     })
@@ -171,9 +198,13 @@ suite('session routes', () => {
 
       const detailB = (await app.inject({ method: 'GET', url: `/sessions/${b}`, headers: auth })).json()
       expect(detailB.status).toBe('pairing')
-      const qrB = (await app.inject({ method: 'GET', url: `/sessions/${b}/qr`, headers: auth })).json()
+      const qrB = (
+        await app.inject({ method: 'GET', url: `/sessions/${b}/qr?ownerId=${TEST_OWNER}`, headers: auth })
+      ).json()
       expect(qrB.qr).toBe('qr-for-b')
-      const qrA = (await app.inject({ method: 'GET', url: `/sessions/${a}/qr`, headers: auth })).json()
+      const qrA = (
+        await app.inject({ method: 'GET', url: `/sessions/${a}/qr?ownerId=${TEST_OWNER}`, headers: auth })
+      ).json()
       expect(qrA.qr).toBeNull()
     })
   })
@@ -207,7 +238,7 @@ suite('session routes', () => {
         method: 'POST',
         url: `/sessions/${id}/pair`,
         headers: auth,
-        payload: { phoneNumber: '+62 877-1384-8500' },
+        payload: { phoneNumber: '+62 877-1384-8500', ownerId: TEST_OWNER },
       })
       expect(res.statusCode).toBe(200)
       expect(res.json()).toMatchObject({ phoneNumber: '6287713848500', pairingCode: 'ABCD1234' })
@@ -221,7 +252,7 @@ suite('session routes', () => {
         method: 'POST',
         url: `/sessions/${id}/pair`,
         headers: auth,
-        payload: { phoneNumber: '081234567890' },
+        payload: { phoneNumber: '081234567890', ownerId: TEST_OWNER },
       })
       expect(res.statusCode).toBe(400)
       expect(res.json().error_code).toBe('invalid_payload')
@@ -233,7 +264,11 @@ suite('session routes', () => {
     it('returns null when there is no current code', async () => {
       app = makeApp()
       const id = await createSessionVia(app)
-      const res = await app.inject({ method: 'GET', url: `/sessions/${id}/qr`, headers: auth })
+      const res = await app.inject({
+        method: 'GET',
+        url: `/sessions/${id}/qr?ownerId=${TEST_OWNER}`,
+        headers: auth,
+      })
       expect(res.statusCode).toBe(200)
       expect(res.json()).toMatchObject({ id, qr: null })
     })
@@ -245,7 +280,11 @@ suite('session routes', () => {
       app = makeApp({
         snapshot: () => snap({ id, status: 'pairing', qr: '2@abc,def,ghi' }),
       })
-      const res = await app.inject({ method: 'GET', url: `/sessions/${id}/qr`, headers: auth })
+      const res = await app.inject({
+        method: 'GET',
+        url: `/sessions/${id}/qr?ownerId=${TEST_OWNER}`,
+        headers: auth,
+      })
       expect(res.json()).toMatchObject({ qr: '2@abc,def,ghi', status: 'pairing' })
     })
   })
@@ -481,7 +520,7 @@ suite('session routes', () => {
         method: 'POST',
         url: `/sessions/${id}/pair`,
         headers: auth,
-        payload: { phoneNumber: '6287713848500' },
+        payload: { phoneNumber: '6287713848500', ownerId: TEST_OWNER },
       })
 
       expect(res.statusCode).not.toBe(500)
@@ -500,7 +539,7 @@ suite('session routes', () => {
         method: 'POST',
         url: `/sessions/${id}/pair`,
         headers: auth,
-        payload: { phoneNumber: '6287713848500' },
+        payload: { phoneNumber: '6287713848500', ownerId: TEST_OWNER },
       })
       expect(res.json()).toMatchObject({ error_code: 'session_logged_out', retryable: false })
     })
@@ -517,7 +556,7 @@ suite('session routes', () => {
         method: 'POST',
         url: `/sessions/${id}/pair`,
         headers: auth,
-        payload: { phoneNumber: '6287713848500' },
+        payload: { phoneNumber: '6287713848500', ownerId: TEST_OWNER },
       })
       expect(res.statusCode).toBe(502)
       expect(res.json().error_code).toBe('pairing_failed')
@@ -556,7 +595,11 @@ suite('session routes', () => {
       const id = await createSessionVia(app, 'route test qr status')
       await pool.query("UPDATE wa_sessions SET status = 'logged_out' WHERE id = $1", [id])
 
-      const res = await app.inject({ method: 'GET', url: `/sessions/${id}/qr`, headers: auth })
+      const res = await app.inject({
+        method: 'GET',
+        url: `/sessions/${id}/qr?ownerId=${TEST_OWNER}`,
+        headers: auth,
+      })
       expect(res.json()).toMatchObject({ id, status: 'logged_out', qr: null })
     })
   })
@@ -565,7 +608,12 @@ suite('session routes', () => {
     it('returns a logged-out session to new so it can be paired again', async () => {
       app = makeApp()
       const id = await createSessionVia(app, 'route test reset')
-      const res = await app.inject({ method: 'POST', url: `/sessions/${id}/reset`, headers: auth })
+      const res = await app.inject({
+        method: 'POST',
+        url: `/sessions/${id}/reset`,
+        headers: auth,
+        payload: { ownerId: TEST_OWNER },
+      })
       expect(res.statusCode).toBe(200)
       expect(res.json()).toMatchObject({ id, status: 'new' })
     })
@@ -576,6 +624,19 @@ suite('session routes', () => {
         method: 'POST',
         url: '/sessions/00000000-0000-0000-0000-000000000000/reset',
         headers: auth,
+        payload: { ownerId: TEST_OWNER },
+      })
+      expect(res.statusCode).toBe(404)
+    })
+
+    it('404s a session owned by someone else', async () => {
+      app = makeApp()
+      const id = await createSessionVia(app, 'route test reset wrong owner')
+      const res = await app.inject({
+        method: 'POST',
+        url: `/sessions/${id}/reset`,
+        headers: auth,
+        payload: { ownerId: 'someone-else' },
       })
       expect(res.statusCode).toBe(404)
     })
@@ -589,6 +650,7 @@ suite('session routes', () => {
         method: 'POST',
         url: `/sessions/${id}/logout`,
         headers: auth,
+        payload: { ownerId: TEST_OWNER },
       })
       expect(res.statusCode).toBe(200)
       expect(res.json()).toMatchObject({ id, status: 'logged_out' })
@@ -601,7 +663,12 @@ suite('session routes', () => {
       app = makeApp({ delete: async (id: string) => void (deletedId = id) })
       const id = await createSessionVia(app, 'route test delete')
 
-      const res = await app.inject({ method: 'DELETE', url: `/sessions/${id}`, headers: auth })
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/sessions/${id}`,
+        headers: auth,
+        payload: { ownerId: TEST_OWNER },
+      })
       expect(res.statusCode).toBe(204)
       expect(deletedId).toBe(id)
     })
@@ -612,6 +679,7 @@ suite('session routes', () => {
         method: 'DELETE',
         url: '/sessions/00000000-0000-0000-0000-000000000000',
         headers: auth,
+        payload: { ownerId: TEST_OWNER },
       })
       expect(res.statusCode).toBe(404)
     })
@@ -619,7 +687,12 @@ suite('session routes', () => {
     it('requires manage, not just read', async () => {
       app = makeApp()
       const id = await createSessionVia(app, 'route test delete auth')
-      const res = await app.inject({ method: 'DELETE', url: `/sessions/${id}`, headers: sendAuth })
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/sessions/${id}`,
+        headers: sendAuth,
+        payload: { ownerId: TEST_OWNER },
+      })
       expect(res.statusCode).toBe(403)
     })
   })

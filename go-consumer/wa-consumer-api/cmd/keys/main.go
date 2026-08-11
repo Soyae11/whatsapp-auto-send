@@ -24,6 +24,7 @@ func main() {
 
 func run() error {
 	var (
+		owner       = flag.String("owner", "", "opaque owner id this key belongs to (a wa-console user id for self-service keys)")
 		name        = flag.String("name", "", "human-readable name for the key, e.g. wa-console")
 		project     = flag.String("project", "", "project/team the key belongs to")
 		environment = flag.String("env", "test", "live or test")
@@ -54,6 +55,7 @@ func run() error {
 	defer s.Close()
 
 	key, secret, err := s.CreateAPIKey(ctx, store.APIKeyInput{
+		OwnerID:     *owner,
 		Name:        *name,
 		Project:     *project,
 		Environment: env,

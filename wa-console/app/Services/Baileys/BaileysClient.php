@@ -8,43 +8,51 @@ use Illuminate\Support\Facades\Http;
 
 class BaileysClient
 {
-    public function list(): array
+    public function list(string $ownerId): array
     {
-        return $this->request()->get('/sessions')->throw($this->mapError())->json('sessions');
+        return $this->request()->get('/sessions', ['ownerId' => $ownerId])
+            ->throw($this->mapError())->json('sessions');
     }
 
-    public function create(string $label): array
+    public function create(string $label, string $ownerId): array
     {
-        return $this->request()->post('/sessions', ['label' => $label])
+        return $this->request()->post('/sessions', ['label' => $label, 'ownerId' => $ownerId])
             ->throw($this->mapError())->json();
     }
 
-    public function connect(string $id): array
+    public function connect(string $id, string $ownerId): array
     {
-        return $this->request()->post("/sessions/{$id}/connect")
+        return $this->request()->post("/sessions/{$id}/connect", ['ownerId' => $ownerId])
             ->throw($this->mapError())->json();
     }
 
-    public function pair(string $id, string $phoneNumber): array
+    public function pair(string $id, string $phoneNumber, string $ownerId): array
     {
-        return $this->request()->post("/sessions/{$id}/pair", ['phoneNumber' => $phoneNumber])
+        return $this->request()->post("/sessions/{$id}/pair", ['phoneNumber' => $phoneNumber, 'ownerId' => $ownerId])
             ->throw($this->mapError())->json();
     }
 
-    public function qr(string $id): array
+    public function qr(string $id, string $ownerId): array
     {
-        return $this->request()->get("/sessions/{$id}/qr")->throw($this->mapError())->json();
-    }
-
-    public function logout(string $id): array
-    {
-        return $this->request()->post("/sessions/{$id}/logout")
+        return $this->request()->get("/sessions/{$id}/qr", ['ownerId' => $ownerId])
             ->throw($this->mapError())->json();
     }
 
-    public function delete(string $id): void
+    public function logout(string $id, string $ownerId): array
     {
-        $this->request()->delete("/sessions/{$id}")->throw($this->mapError());
+        return $this->request()->post("/sessions/{$id}/logout", ['ownerId' => $ownerId])
+            ->throw($this->mapError())->json();
+    }
+
+    public function reset(string $id, string $ownerId): array
+    {
+        return $this->request()->post("/sessions/{$id}/reset", ['ownerId' => $ownerId])
+            ->throw($this->mapError())->json();
+    }
+
+    public function delete(string $id, string $ownerId): void
+    {
+        $this->request()->delete("/sessions/{$id}", ['ownerId' => $ownerId])->throw($this->mapError());
     }
 
     protected function request(): PendingRequest

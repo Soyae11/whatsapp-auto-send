@@ -21,10 +21,42 @@ import (
 	"wa-shared/logging"
 	"wa-shared/notify"
 	"wa-shared/ratelimit"
+	"wa-shared/senders"
 	"wa-shared/slots"
 	"wa-shared/store"
+	"wa-shared/tasks"
 	"wa-shared/wa"
 )
+
+// senderRegistryPollInterval is how stale the live registry can be after an admin change that
+// isn't followed by an immediate refresh (see api.Server.refreshSenders) — e.g. a change made
+// by a different process/replica.
+const senderRegistryPollInterval = 5 * time.Second
+
+func loadSenderRegistry(jobs *store.Store, dryRun bool) func(context.Context) (*senders.Registry, error) {
+	return func(ctx context.Context) (*senders.Registry, error) {
+		rows, err := jobs.ListAllSenders(ctx)
+		if err != nil {
+			return nil, err
+		}
+		list := make([]senders.Sender, 0, len(rows))
+		for _, row := range rows {
+			mode := senders.ModeSingle
+			if row.Mode == store.SenderModePool {
+				mode = senders.ModePool
+			}
+			list = append(list, senders.Sender{
+				Name:            row.Name,
+				Mode:            mode,
+				SessionID:       row.SessionID,
+				OwnerID:         row.OwnerID,
+				DefaultPriority: tasks.PriorityDefault,
+				DryRun:          dryRun,
+			})
+		}
+		return senders.New(list)
+	}
+}
 
 var version = "dev"
 
@@ -96,6 +128,13 @@ func run() error {
 		return err
 	}
 
+	loadRegistry := loadSenderRegistry(jobs, cfg.DryRun)
+	initialRegistry, err := loadRegistry(bootCtx)
+	if err != nil {
+		return fmt.Errorf("load sender registry: %w", err)
+	}
+	senderCache := senders.NewCache(initialRegistry, loadRegistry)
+
 	server := api.New(api.Options{
 		Enqueuer:       dispatch.New(asynqClient, inspector, allocator, coalescer, jobs, log),
 		WA:             waClient,
@@ -103,7 +142,8 @@ func run() error {
 		Jobs:           jobs,
 		Keys:           jobs,
 		Limiter:        limiter,
-		Senders:        cfg.Senders,
+		Senders:        senderCache,
+		SenderStore:    jobs,
 		Messages:       jobs,
 		Idempotency:    jobs,
 		Sessions:       api.NewSessionCache(waClient, api.SessionStatusTTL),
@@ -139,6 +179,9 @@ func run() error {
 	defer stop()
 
 	go purgeIdempotency(ctx, jobs, log)
+	go senderCache.Watch(ctx, senderRegistryPollInterval, func(err error) {
+		log.Warn("could not refresh sender registry", "error", err)
+	})
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -149,7 +192,7 @@ func run() error {
 			"slot_spread", cfg.Slots.MinSpread.String()+"–"+cfg.Slots.MaxSpread.String(),
 			"slot_horizon", cfg.Slots.Horizon.String(),
 			"coalesce_window", cfg.Coalesce.Window.String(),
-			"senders", cfg.Senders.Names(),
+			"senders", senderCache.Load().Names(),
 			"rate_limit_window", cfg.RateLimitWindow.String(),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

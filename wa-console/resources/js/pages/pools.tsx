@@ -73,7 +73,7 @@ export default function Pools({
     const [createSession, setCreateSession] = useState('');
 
     const poolableSenders = senders.filter(
-        (s) => (pools[s.name] ?? []).length === 0,
+        (s) => s.mode === 'pool' && (pools[s.name] ?? []).length === 0,
     );
     const pooledSenders = senders.filter(
         (s) => (pools[s.name] ?? []).length > 0,

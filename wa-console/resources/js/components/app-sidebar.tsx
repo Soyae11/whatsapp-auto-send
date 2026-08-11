@@ -2,8 +2,10 @@ import { Link } from '@inertiajs/react';
 import {
     BookOpen,
     FolderGit2,
+    KeyRound,
     LayoutGrid,
     MessagesSquare,
+    Radio,
     Send,
     Shuffle,
 } from 'lucide-react';
@@ -20,7 +22,7 @@ import {
     SidebarMenuButton,
     SidebarMenuItem,
 } from '@/components/ui/sidebar';
-import { dashboard, messages, pools, send } from '@/routes';
+import { apiKeys, dashboard, messages, pools, send, senders } from '@/routes';
 import type { NavItem } from '@/types';
 
 const mainNavItems: NavItem[] = [
@@ -43,6 +45,16 @@ const mainNavItems: NavItem[] = [
         title: 'Pools',
         href: pools(),
         icon: Shuffle,
+    },
+    {
+        title: 'Senders',
+        href: senders(),
+        icon: Radio,
+    },
+    {
+        title: 'API Keys',
+        href: apiKeys(),
+        icon: KeyRound,
     },
 ];
 

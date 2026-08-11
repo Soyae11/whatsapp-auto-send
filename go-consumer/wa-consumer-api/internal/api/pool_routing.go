@@ -12,9 +12,16 @@ import (
 // the send outright, never fall back to anything.
 var errSenderPoolExhausted = errors.New("api: sender pool exhausted")
 
-// resolveSendSession overrides sender.SessionID with its pool's current session, when it has
-// one. A sender with no pool rows is returned unchanged — this is the common case, and costs
-// nothing beyond the one Pool lookup.
+// errSenderPoolMisconfigured means the sender is declared pool mode (senders.ModePool) but no
+// pool rows exist for it yet — an operator changed WA_SENDERS to "name:pool" without ever
+// calling POST /internal/senders/{name}/pool to create the pool. Unlike errSenderPoolExhausted
+// (a pool that existed and failed), this is a deploy-time config error.
+var errSenderPoolMisconfigured = errors.New("api: sender declared pool mode but has no pool")
+
+// resolveSendSession overrides sender.SessionID with its pool's current session, for pool-mode
+// senders. Single-mode senders are returned unchanged without ever touching the pool store —
+// mode is decided once, at config-parse time, not inferred from what happens to be in the
+// database.
 //
 // Load spreading (batch sends and a busy queue are the same signal — see pools.go's package
 // comment) lives here too: once main's estimated wait crosses poolBusyDelay, new sends share
@@ -23,6 +30,9 @@ var errSenderPoolExhausted = errors.New("api: sender pool exhausted")
 // never changes who is main; that only happens on an actual send failure (see the dispatcher
 // and receipts.go).
 func (s *Server) resolveSendSession(ctx context.Context, sender senders.Sender) (senders.Sender, error) {
+	if sender.Mode != senders.ModePool {
+		return sender, nil
+	}
 	if s.pools == nil {
 		return sender, nil
 	}
@@ -32,7 +42,7 @@ func (s *Server) resolveSendSession(ctx context.Context, sender senders.Sender) 
 		return sender, err
 	}
 	if len(members) == 0 {
-		return sender, nil
+		return sender, errSenderPoolMisconfigured
 	}
 
 	var main string
@@ -81,6 +91,9 @@ func (s *Server) resolveSendSession(ctx context.Context, sender senders.Sender) 
 // synchronous path for the one case that does resend.
 func (s *Server) rotatePoolAfterFailure(ctx context.Context, sender, failedSessionID string) {
 	if s.pools == nil {
+		return
+	}
+	if known, err := s.senders.Load().Get(sender); err != nil || known.Mode != senders.ModePool {
 		return
 	}
 	if _, err := s.pools.Rotate(ctx, sender, failedSessionID, s.isCircuitOpen(ctx)); err != nil {

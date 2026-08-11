@@ -114,6 +114,9 @@ type Key struct {
 	RevokedAt   *time.Time
 	ExpiresAt   *time.Time
 	CreatedAt   time.Time
+	// OwnerID is an opaque wa-console user id — empty for keys minted before ownership
+	// existed (see rollout notes), set for every key created through /internal/keys.
+	OwnerID string
 }
 
 func (k Key) MaySend(sender string) bool {

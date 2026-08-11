@@ -37,6 +37,19 @@ type JobStore interface {
 
 type KeyStore interface {
 	AuthenticateAPIKey(ctx context.Context, hash string) (*auth.Key, error)
+	CreateAPIKey(ctx context.Context, in store.APIKeyInput) (*auth.Key, auth.Secret, error)
+	ListAPIKeysByOwner(ctx context.Context, ownerID string) ([]auth.Key, error)
+	RevokeAPIKeyByOwner(ctx context.Context, id, ownerID string) (*auth.Key, bool, error)
+}
+
+// SenderStore is the wa_senders table — see wa-shared/store/senders.go. Distinct from Pools:
+// this is which senders exist and who owns them, not a pool-mode sender's session membership.
+type SenderStore interface {
+	ListAllSenders(ctx context.Context) ([]store.SenderRow, error)
+	ListSenders(ctx context.Context, ownerID string) ([]store.SenderRow, error)
+	CreateSender(ctx context.Context, in store.SenderInput) (*store.SenderRow, error)
+	GetSender(ctx context.Context, name string) (*store.SenderRow, error)
+	DeleteSender(ctx context.Context, name, ownerID string) error
 }
 
 type MessageStore interface {
@@ -57,6 +70,7 @@ type IdempotencyStore interface {
 // rows is unaffected by any of this; pools are opt-in.
 type Pools interface {
 	Pool(ctx context.Context, sender string) ([]store.PoolMember, error)
+	CurrentMain(ctx context.Context, sender string) (sessionID string, hasPool bool, err error)
 	CreatePool(ctx context.Context, sender string, sessionIDs []string) error
 	DeletePool(ctx context.Context, sender string) error
 	Promote(ctx context.Context, sender, newMainSessionID string) error
@@ -82,7 +96,8 @@ type Options struct {
 	Jobs        JobStore
 	Keys        KeyStore
 	Limiter     RateLimiter
-	Senders     *senders.Registry
+	Senders     *senders.Cache
+	SenderStore SenderStore
 	Messages    MessageStore
 	Idempotency IdempotencyStore
 	Sessions    SessionStatusSource
@@ -127,7 +142,8 @@ type Server struct {
 	jobs           JobStore
 	keys           KeyStore
 	limiter        RateLimiter
-	senders        *senders.Registry
+	senders        *senders.Cache
+	senderStore    SenderStore
 	messages       MessageStore
 	idempotency    IdempotencyStore
 	sessions       SessionStatusSource
@@ -168,6 +184,7 @@ func New(o Options) *Server {
 		keys:           o.Keys,
 		limiter:        o.Limiter,
 		senders:        o.Senders,
+		senderStore:    o.SenderStore,
 		messages:       o.Messages,
 		idempotency:    o.Idempotency,
 		sessions:       o.Sessions,
@@ -267,6 +284,12 @@ func (s *Server) operatorRoutes() *http.ServeMux {
 	operator.HandleFunc("DELETE /internal/senders/{name}/pool/members/{sessionId}", s.handleRemovePoolMember)
 	operator.HandleFunc("POST /internal/senders/{name}/pool/promote", s.handlePromotePoolMember)
 	operator.HandleFunc("POST /internal/senders/{name}/pool/members/{sessionId}/reinstate", s.handleReinstatePoolMember)
+	operator.HandleFunc("GET /internal/senders", s.handleListSendersAdmin)
+	operator.HandleFunc("POST /internal/senders", s.handleCreateSender)
+	operator.HandleFunc("DELETE /internal/senders/{name}", s.handleDeleteSender)
+	operator.HandleFunc("GET /internal/keys", s.handleListKeys)
+	operator.HandleFunc("POST /internal/keys", s.handleCreateKey)
+	operator.HandleFunc("POST /internal/keys/{id}/revoke", s.handleRevokeKey)
 
 	return operator
 }
@@ -318,7 +341,7 @@ func (s *Server) resolveSender(w http.ResponseWriter, r *http.Request, name stri
 		return senders.Sender{}, false
 	}
 
-	sender, err := s.senders.Get(name)
+	sender, err := s.senders.Load().Get(name)
 	if err != nil {
 		writeFieldProblem(w, r, CodeUnknownSender,
 			"No sender named "+quoteOrEmpty(name)+". This key may use: "+strings.Join(key.Senders, ", ")+".",

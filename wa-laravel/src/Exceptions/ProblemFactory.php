@@ -25,6 +25,8 @@ final class ProblemFactory
         'internal_error' => InternalError::class,
         'sender_unavailable' => SenderUnavailable::class,
         'queue_horizon_exceeded' => QueueHorizonExceeded::class,
+        'sender_pool_exhausted' => SenderPoolExhausted::class,
+        'sender_pool_misconfigured' => SenderPoolMisconfigured::class,
     ];
 
     public static function fromResponse(Response $response): WaException

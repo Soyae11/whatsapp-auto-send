@@ -8,21 +8,40 @@ import { sendTextMessage } from '../messages/send.js'
 import type { SessionManager } from '../sessions/manager.js'
 import {
   createSession,
+  getOwnedSession,
   getSession,
   listSessions,
+  listSessionsByOwner,
   type SessionRow,
 } from '../sessions/repository.js'
 import { mapPairingError } from '../wa/error-mapping.js'
 import { InvalidPhoneNumberError, normalisePhoneNumber } from '../wa/phone.js'
 import { WA_TIMEOUTS, withTimeout } from '../wa/timeout.js'
 
+// Every "manage"-capability route below is callable only by wa-console (see auth.ts's
+// ROUTE_CAPABILITIES — 'manage' is never granted to the dispatcher key), so ownerId can be
+// required unconditionally there: it is always wa-console asserting which of its own
+// authenticated users this call is on behalf of, exactly like ADMIN_API_KEY callers do on the
+// Go side. "read" routes (GET /sessions, GET /sessions/:id) stay reachable by the dispatcher
+// too, which has no owner concept at all — see the list handler below for how that's kept
+// backward compatible.
+const ownerIdField = z.string().trim().min(1, 'ownerId is required')
+
 const createBody = z.object({
   label: z.string().trim().min(1, 'label is required').max(200),
+  ownerId: ownerIdField,
 })
 
 const pairBody = z.object({
   phoneNumber: z.string().min(1, 'phoneNumber is required'),
+  ownerId: ownerIdField,
 })
+
+const ownerBody = z.object({ ownerId: ownerIdField })
+
+const ownerQuery = z.object({ ownerId: ownerIdField })
+
+const listQuery = z.object({ ownerId: z.string().trim().min(1).optional() })
 
 const sendBody = z.object({
   idempotencyKey: z.string().trim().min(1).max(255),
@@ -108,14 +127,23 @@ export function registerSessionRoutes(app: AppInstance, deps: SessionRouteDeps):
     return row
   }
 
+  // Owner mismatch and nonexistence both come back as sessionNotFound, so a caller can't tell
+  // "no such session" from "someone else's session" — same reasoning as the Go admin API.
+  async function loadOwnedSession(id: string, ownerId: string): Promise<SessionRow> {
+    const row = await getOwnedSession(pool, id, ownerId)
+    if (!row) throw sessionNotFound(id)
+    return row
+  }
+
   app.post('/sessions', async (req, reply) => {
-    const { label } = parse(createBody, req.body)
-    const row = await createSession(pool, label)
+    const { label, ownerId } = parse(createBody, req.body)
+    const row = await createSession(pool, label, ownerId)
     return reply.code(201).send(toView(row, sessions))
   })
 
-  app.get('/sessions', async () => {
-    const rows = await listSessions(pool)
+  app.get('/sessions', async (req) => {
+    const { ownerId } = parse(listQuery, req.query)
+    const rows = ownerId ? await listSessionsByOwner(pool, ownerId) : await listSessions(pool)
     return { sessions: rows.map((row) => toView(row, sessions)) }
   })
 
@@ -126,15 +154,16 @@ export function registerSessionRoutes(app: AppInstance, deps: SessionRouteDeps):
 
   app.post('/sessions/:id/connect', async (req) => {
     const { id } = parse(idParams, req.params)
-    await loadSession(id)
+    const { ownerId } = parse(ownerBody, req.body)
+    await loadOwnedSession(id, ownerId)
     const snapshot = await sessions.connect(id)
     return { id, status: snapshot.status }
   })
 
   app.post('/sessions/:id/pair', async (req) => {
     const { id } = parse(idParams, req.params)
-    const { phoneNumber } = parse(pairBody, req.body)
-    await loadSession(id)
+    const { phoneNumber, ownerId } = parse(pairBody, req.body)
+    await loadOwnedSession(id, ownerId)
 
     let digits: string
     try {
@@ -162,7 +191,8 @@ export function registerSessionRoutes(app: AppInstance, deps: SessionRouteDeps):
 
   app.get('/sessions/:id/qr', async (req) => {
     const { id } = parse(idParams, req.params)
-    const row = await loadSession(id)
+    const { ownerId } = parse(ownerQuery, req.query)
+    const row = await loadOwnedSession(id, ownerId)
     const live = sessions.snapshot(id)
     return { id, status: live?.status ?? row.status, qr: live?.qr ?? null }
   })
@@ -176,21 +206,24 @@ export function registerSessionRoutes(app: AppInstance, deps: SessionRouteDeps):
 
   app.post('/sessions/:id/reset', async (req) => {
     const { id } = parse(idParams, req.params)
-    await loadSession(id)
+    const { ownerId } = parse(ownerBody, req.body)
+    await loadOwnedSession(id, ownerId)
     await sessions.reset(id)
     return { id, status: 'new' }
   })
 
   app.post('/sessions/:id/logout', async (req) => {
     const { id } = parse(idParams, req.params)
-    await loadSession(id)
+    const { ownerId } = parse(ownerBody, req.body)
+    await loadOwnedSession(id, ownerId)
     await sessions.logout(id)
     return { id, status: 'logged_out' }
   })
 
   app.delete('/sessions/:id', async (req, reply) => {
     const { id } = parse(idParams, req.params)
-    await loadSession(id)
+    const { ownerId } = parse(ownerBody, req.body)
+    await loadOwnedSession(id, ownerId)
     await sessions.delete(id)
     return reply.code(204).send()
   })

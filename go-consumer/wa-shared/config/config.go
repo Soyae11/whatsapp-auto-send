@@ -55,7 +55,12 @@ type Config struct {
 
 	Sessions []string
 
+	// Senders is only set when WA_SENDERS is non-empty. It is no longer the live registry —
+	// see wa-shared/senders/cache.go — but stays available as a one-time seed source for
+	// cmd/seed-senders, and DryRun below is what a DB-backed registry needs applied on every
+	// refresh, not just at boot.
 	Senders *senders.Registry
+	DryRun  bool
 
 	RateLimitWindow time.Duration
 
@@ -233,16 +238,19 @@ func Load() (*Config, error) {
 		fail("%v", err)
 	}
 
-	if c.Senders, err = senders.Parse(os.Getenv("WA_SENDERS"), c.Sessions); err != nil {
-		fail("WA_SENDERS: %v", err)
-	}
-
-	dryRun, err := boolOr("WA_DRY_RUN", false)
-	if err != nil {
+	if c.DryRun, err = boolOr("WA_DRY_RUN", false); err != nil {
 		fail("%v", err)
 	}
-	if dryRun && c.Senders != nil {
-		c.Senders.ForceDryRun()
+
+	// WA_SENDERS is now optional: an unset value means senders come entirely from the
+	// database (wa_senders, via cmd/seed-senders or wa-console's Senders page). Set, it is
+	// still parsed strictly and available as a one-time seed for cmd/seed-senders.
+	if raw := os.Getenv("WA_SENDERS"); raw != "" {
+		if c.Senders, err = senders.Parse(raw, c.Sessions); err != nil {
+			fail("WA_SENDERS: %v", err)
+		} else if c.DryRun {
+			c.Senders.ForceDryRun()
+		}
 	}
 
 	if c.RateLimitWindow, err = durationOr("RATE_LIMIT_WINDOW", ratelimit.DefaultWindow); err != nil {

@@ -252,6 +252,12 @@ func (s *Server) planSend(w http.ResponseWriter, r *http.Request, req sendFields
 				"before this sender can send again — queueing would only delay the same failure.")
 			return sendPlan{}, false
 		}
+		if errors.Is(err, errSenderPoolMisconfigured) {
+			writeProblem(w, r, CodeSenderPoolMisconfigured, "Sender "+quoteOrEmpty(sender.Name)+
+				" is configured for pool mode but has no pool yet. An operator has to create one "+
+				"via POST /internal/senders/"+sender.Name+"/pool before this sender can send.")
+			return sendPlan{}, false
+		}
 		s.log.Error("could not resolve a session for sender",
 			"request_id", requestIDFrom(r.Context()), "sender", sender.Name, "error", err)
 		writeProblem(w, r, CodeInternalError, "The message could not be queued. It is safe to retry.")
@@ -524,7 +530,7 @@ func (s *Server) senderCanSend(w http.ResponseWriter, r *http.Request, sender *s
 		return true
 	}
 
-	if s.pools != nil {
+	if s.pools != nil && sender.Mode == senders.ModePool {
 		promotedTo, err := s.pools.Rotate(ctx, sender.Name, sender.SessionID, s.isCircuitOpen(ctx))
 		if err != nil {
 			s.log.Error("could not rotate pool for a logged-out sender",

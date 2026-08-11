@@ -23,6 +23,11 @@ type messageList struct {
 
 type senderView struct {
 	Name                  string `json:"name"`
+	Mode                  string `json:"mode"`
+	// OwnerID is metadata only — it grants nothing by itself, key.MaySend already gates
+	// whether this key may use the sender at all. wa-console uses it to show each of its
+	// users only their own senders on the Send and Pools pages.
+	OwnerID               string `json:"owner_id,omitempty"`
 	Health                string `json:"health"`
 	Detail                string `json:"detail"`
 	Accepting             bool   `json:"accepting"`
@@ -40,6 +45,18 @@ const (
 	healthDegraded    = "degraded"
 	healthUnavailable = "unavailable"
 )
+
+const (
+	senderModeSingle = "single"
+	senderModePool   = "pool"
+)
+
+func senderModeString(m senders.Mode) string {
+	if m == senders.ModePool {
+		return senderModePool
+	}
+	return senderModeSingle
+}
 
 func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	key, ok := s.requireKey(w, r)
@@ -148,12 +165,13 @@ func (s *Server) handleListSenders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	registry := s.senders.Load()
 	out := senderList{Data: []senderView{}}
-	for _, name := range s.senders.Names() {
+	for _, name := range registry.Names() {
 		if !key.MaySend(name) {
 			continue
 		}
-		sender, err := s.senders.Get(name)
+		sender, err := registry.Get(name)
 		if err != nil {
 			continue
 		}
@@ -172,17 +190,37 @@ func (s *Server) senderStatus(r *http.Request, sender senders.Sender) senderView
 
 	view := senderView{
 		Name:       sender.Name,
+		Mode:       senderModeString(sender.Mode),
+		OwnerID:    sender.OwnerID,
 		Health:     healthAvailable,
 		Detail:     "Sending normally.",
 		Accepting:  true,
 		DryRunOnly: sender.DryRun,
 	}
 
-	if depth, err := s.enqueuer.QueueDepth(sender.SessionID); err == nil {
+	sessionID, err := s.currentSessionID(ctx, sender)
+	switch {
+	case errors.Is(err, errSenderPoolMisconfigured):
+		view.Health = healthUnavailable
+		view.Accepting = false
+		view.Detail = "Sender is configured for pool mode but has no pool yet. An operator has to create one before this sender can send."
+		return view
+	case errors.Is(err, errSenderPoolExhausted):
+		view.Health = healthUnavailable
+		view.Accepting = false
+		view.Detail = "Every session in this sender's pool has failed and been disqualified. A human has to reinstate one before this sender can send again."
+		return view
+	case err != nil:
+		view.Health = healthDegraded
+		view.Detail = "Health could not be read just now. Sends are still accepted and queued."
+		return view
+	}
+
+	if depth, err := s.enqueuer.QueueDepth(sessionID); err == nil {
 		view.QueueDepth = depth
 	}
 
-	delay, delayErr := s.enqueuer.Depth(ctx, sender.SessionID)
+	delay, delayErr := s.enqueuer.Depth(ctx, sessionID)
 	if delayErr == nil {
 		seconds := int(delay.Round(time.Second).Seconds())
 		view.EstimatedDelaySeconds = &seconds
@@ -200,7 +238,7 @@ func (s *Server) senderStatus(r *http.Request, sender senders.Sender) senderView
 		return view
 	}
 
-	status, err := s.sessionStatus(ctx, sender)
+	status, err := s.sessionStatus(ctx, sessionID)
 	switch {
 	case err != nil:
 		view.Health = healthDegraded
@@ -222,11 +260,35 @@ func (s *Server) senderStatus(r *http.Request, sender senders.Sender) senderView
 	return view
 }
 
-func (s *Server) sessionStatus(ctx context.Context, sender senders.Sender) (wa.SessionStatus, error) {
+// currentSessionID answers which session is actually serving sender right now — its static
+// session for single mode, or its pool's current main for pool mode. Read paths (this file) and
+// the send path (resolveSendSession in pool_routing.go) each need this, but the send path also
+// does busy-based load spreading, which a status read must not trigger as a side effect.
+func (s *Server) currentSessionID(ctx context.Context, sender senders.Sender) (string, error) {
+	if sender.Mode != senders.ModePool {
+		return sender.SessionID, nil
+	}
+	if s.pools == nil {
+		return "", errSenderPoolMisconfigured
+	}
+	sessionID, hasPool, err := s.pools.CurrentMain(ctx, sender.Name)
+	switch {
+	case err != nil:
+		return "", err
+	case !hasPool:
+		return "", errSenderPoolMisconfigured
+	case sessionID == "":
+		return "", errSenderPoolExhausted
+	default:
+		return sessionID, nil
+	}
+}
+
+func (s *Server) sessionStatus(ctx context.Context, sessionID string) (wa.SessionStatus, error) {
 	if s.sessions == nil {
 		return wa.StatusConnected, nil
 	}
-	return s.sessions.Status(ctx, sender.SessionID)
+	return s.sessions.Status(ctx, sessionID)
 }
 
 func (s *Server) parseMessageFilter(w http.ResponseWriter, r *http.Request) (store.MessageFilter, bool) {

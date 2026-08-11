@@ -1,5 +1,6 @@
 export type SenderOption = {
     name: string;
+    mode: 'single' | 'pool';
     health: string;
     accepting: boolean;
 };

@@ -7,6 +7,7 @@ use App\Services\Baileys\BaileysClient;
 use App\Services\WaAdmin\WaAdminClient;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
 use Inertia\Inertia;
 use Inertia\Response;
 use Wa\Laravel\Contracts\WaClient;
@@ -28,7 +29,7 @@ class PoolsController extends Controller
 
         foreach ($senders as $sender) {
             try {
-                $pools[$sender['name']] = $this->admin->pool($sender['name'])['members'];
+                $pools[$sender['name']] = $this->admin->pool($sender['name'], $this->ownerId())['members'];
             } catch (\Throwable $e) {
                 $pools[$sender['name']] = [];
                 Inertia::flash('toast', ['type' => 'error', 'message' => $e->getMessage()]);
@@ -42,7 +43,7 @@ class PoolsController extends Controller
                 'id' => $session['id'],
                 'label' => $session['label'],
                 'phoneNumber' => $session['phoneNumber'] ?? null,
-            ], $this->baileys->list());
+            ], $this->baileys->list($this->ownerId()));
         } catch (\Throwable $e) {
             Inertia::flash('toast', ['type' => 'error', 'message' => $e->getMessage()]);
         }
@@ -62,7 +63,7 @@ class PoolsController extends Controller
             'sessions.*' => ['required', 'string'],
         ]);
 
-        $this->admin->createPool($data['sender'], $data['sessions']);
+        $this->admin->createPool($data['sender'], $data['sessions'], $this->ownerId());
 
         Inertia::flash('toast', ['type' => 'success', 'message' => 'Pool created for '.$data['sender'].'.']);
 
@@ -71,7 +72,7 @@ class PoolsController extends Controller
 
     public function destroy(string $sender): RedirectResponse
     {
-        $this->admin->deletePool($sender);
+        $this->admin->deletePool($sender, $this->ownerId());
 
         Inertia::flash('toast', ['type' => 'success', 'message' => 'Pool deleted for '.$sender.'.']);
 
@@ -82,7 +83,7 @@ class PoolsController extends Controller
     {
         $data = $request->validate(['session_id' => ['required', 'string']]);
 
-        $this->admin->addMember($sender, $data['session_id']);
+        $this->admin->addMember($sender, $data['session_id'], $this->ownerId());
 
         Inertia::flash('toast', ['type' => 'success', 'message' => 'Backup added to '.$sender.'.']);
 
@@ -91,7 +92,7 @@ class PoolsController extends Controller
 
     public function removeMember(string $sender, string $sessionId): RedirectResponse
     {
-        $this->admin->removeMember($sender, $sessionId);
+        $this->admin->removeMember($sender, $sessionId, $this->ownerId());
 
         Inertia::flash('toast', ['type' => 'success', 'message' => 'Session removed from '.$sender.'.']);
 
@@ -102,7 +103,7 @@ class PoolsController extends Controller
     {
         $data = $request->validate(['session_id' => ['required', 'string']]);
 
-        $this->admin->promote($sender, $data['session_id']);
+        $this->admin->promote($sender, $data['session_id'], $this->ownerId());
 
         Inertia::flash('toast', ['type' => 'success', 'message' => 'Promoted to main for '.$sender.'.']);
 
@@ -111,10 +112,15 @@ class PoolsController extends Controller
 
     public function reinstate(string $sender, string $sessionId): RedirectResponse
     {
-        $this->admin->reinstate($sender, $sessionId);
+        $this->admin->reinstate($sender, $sessionId, $this->ownerId());
 
         Inertia::flash('toast', ['type' => 'success', 'message' => 'Session reinstated for '.$sender.'.']);
 
         return back();
+    }
+
+    private function ownerId(): string
+    {
+        return (string) Auth::id();
     }
 }

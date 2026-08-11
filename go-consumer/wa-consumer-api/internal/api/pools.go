@@ -41,6 +41,9 @@ func (s *Server) handleGetPool(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	sender := r.PathValue("name")
+	if !s.requireOwnedSender(w, r, sender) {
+		return
+	}
 	members, err := s.pools.Pool(ctx, sender)
 	if err != nil {
 		s.poolError(w, "read pool", sender, err)
@@ -50,6 +53,7 @@ func (s *Server) handleGetPool(w http.ResponseWriter, r *http.Request) {
 }
 
 type createPoolBody struct {
+	OwnerID  string   `json:"owner_id"`
 	Sessions []string `json:"sessions"`
 }
 
@@ -68,6 +72,9 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	sender := r.PathValue("name")
+	if !s.requirePoolModeSender(w, r, sender, req.OwnerID) {
+		return
+	}
 	if err := s.pools.CreatePool(ctx, sender, req.Sessions); err != nil {
 		s.poolError(w, "create pool", sender, err)
 		return
@@ -81,6 +88,9 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	sender := r.PathValue("name")
+	if !s.requireOwnedSender(w, r, sender) {
+		return
+	}
 	if err := s.pools.DeletePool(ctx, sender); err != nil {
 		s.poolError(w, "delete pool", sender, err)
 		return
@@ -90,6 +100,7 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 }
 
 type poolMemberBody struct {
+	OwnerID   string `json:"owner_id"`
 	SessionID string `json:"session_id"`
 }
 
@@ -103,6 +114,9 @@ func (s *Server) handleAddPoolMember(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	sender := r.PathValue("name")
+	if !s.requirePoolModeSender(w, r, sender, req.OwnerID) {
+		return
+	}
 	if err := s.pools.AddMember(ctx, sender, req.SessionID); err != nil {
 		s.poolError(w, "add pool member", sender, err)
 		return
@@ -116,6 +130,9 @@ func (s *Server) handleRemovePoolMember(w http.ResponseWriter, r *http.Request) 
 	defer cancel()
 
 	sender := r.PathValue("name")
+	if !s.requireOwnedSender(w, r, sender) {
+		return
+	}
 	sessionID := r.PathValue("sessionId")
 	if err := s.pools.RemoveMember(ctx, sender, sessionID); err != nil {
 		s.poolError(w, "remove pool member", sender, err)
@@ -135,6 +152,9 @@ func (s *Server) handlePromotePoolMember(w http.ResponseWriter, r *http.Request)
 	defer cancel()
 
 	sender := r.PathValue("name")
+	if !s.requirePoolModeSender(w, r, sender, req.OwnerID) {
+		return
+	}
 	if err := s.pools.Promote(ctx, sender, req.SessionID); err != nil {
 		s.poolError(w, "promote pool member", sender, err)
 		return
@@ -148,6 +168,9 @@ func (s *Server) handleReinstatePoolMember(w http.ResponseWriter, r *http.Reques
 	defer cancel()
 
 	sender := r.PathValue("name")
+	if !s.requireOwnedSender(w, r, sender) {
+		return
+	}
 	sessionID := r.PathValue("sessionId")
 	if err := s.pools.Reinstate(ctx, sender, sessionID); err != nil {
 		s.poolError(w, "reinstate pool member", sender, err)
@@ -184,6 +207,46 @@ func (s *Server) respondWithPool(w http.ResponseWriter, r *http.Request, status 
 		return
 	}
 	writeJSON(w, status, poolView(sender, members))
+}
+
+// requireOwnedSender rejects a pool operation on a sender that doesn't exist or isn't owned by
+// the caller (read from the "owner_id" query parameter) — used by handlers with no JSON body of
+// their own to carry it. Existence and ownership failures both read back as unknown_sender, so
+// a caller can't distinguish "no such sender" from "someone else's sender".
+func (s *Server) requireOwnedSender(w http.ResponseWriter, r *http.Request, sender string) bool {
+	_, ok := s.checkOwnedSenderRow(w, r, sender, r.URL.Query().Get("owner_id"))
+	return ok
+}
+
+// requirePoolModeSender additionally rejects a sender still declared single-mode — otherwise a
+// pool would silently start serving traffic the sender's own record claims is single-session.
+// ownerID here comes from the caller's own JSON body (create/add/promote all already decode
+// one), not the query string.
+func (s *Server) requirePoolModeSender(w http.ResponseWriter, r *http.Request, sender, ownerID string) bool {
+	known, ok := s.checkOwnedSenderRow(w, r, sender, ownerID)
+	if !ok {
+		return false
+	}
+	if known.Mode != store.SenderModePool {
+		writeError(w, http.StatusConflict, errorBody{
+			ErrorCode: "sender_not_pool_mode",
+			Message:   "sender " + sender + " is a single-mode sender; create it as a pool sender before creating or adding to a pool for it",
+		})
+		return false
+	}
+	return true
+}
+
+func (s *Server) checkOwnedSenderRow(w http.ResponseWriter, r *http.Request, sender, ownerID string) (store.SenderRow, bool) {
+	known, err := s.senderStore.GetSender(r.Context(), sender)
+	if err != nil || known.OwnerID != ownerID {
+		writeError(w, http.StatusNotFound, errorBody{
+			ErrorCode: "unknown_sender",
+			Message:   "no sender named '" + sender + "'",
+		})
+		return store.SenderRow{}, false
+	}
+	return *known, true
 }
 
 func (s *Server) poolError(w http.ResponseWriter, action, sender string, err error) {

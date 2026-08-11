@@ -76,6 +76,21 @@ export default function Send({
                                                     'available'
                                                         ? ` (${sender.health})`
                                                         : ''}
+                                                    <span>
+                                                        <Badge
+                                                            variant={
+                                                                sender.mode ===
+                                                                'pool'
+                                                                    ? 'secondary'
+                                                                    : 'outline'
+                                                            }
+                                                        >
+                                                            {sender.mode ===
+                                                            'pool'
+                                                                ? 'Pool'
+                                                                : 'Session'}
+                                                        </Badge>
+                                                    </span>
                                                 </SelectItem>
                                             ))}
                                         </SelectContent>

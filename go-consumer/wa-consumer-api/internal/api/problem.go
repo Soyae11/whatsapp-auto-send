@@ -7,25 +7,26 @@ import (
 )
 
 const (
-	CodeInvalidRequest        = "invalid_request"
-	CodeInvalidPhoneNumber    = "invalid_phone_number"
-	CodeUnknownSender         = "unknown_sender"
-	CodeIdempotencyKeyReq     = "idempotency_key_required"
-	CodeBatchTooLarge         = "batch_too_large"
-	CodeSenderNotPermitted    = "sender_not_permitted"
-	CodeUnauthenticated       = "unauthenticated"
-	CodeNotFound              = "not_found"
-	CodeMethodNotAllowed      = "method_not_allowed"
-	CodeMessageNotFound       = "message_not_found"
-	CodeMessageNotCancellable = "message_not_cancellable"
-	CodeIdempotencyConflict   = "idempotency_key_reused_with_different_payload"
-	CodePayloadTooLarge       = "payload_too_large"
-	CodeUnsupportedMedia      = "unsupported_media_type"
-	CodeRateLimited           = "rate_limited"
-	CodeQueueHorizonExceeded  = "queue_horizon_exceeded"
-	CodeSenderUnavailable     = "sender_unavailable"
-	CodeSenderPoolExhausted   = "sender_pool_exhausted"
-	CodeInternalError         = "internal_error"
+	CodeInvalidRequest          = "invalid_request"
+	CodeInvalidPhoneNumber      = "invalid_phone_number"
+	CodeUnknownSender           = "unknown_sender"
+	CodeIdempotencyKeyReq       = "idempotency_key_required"
+	CodeBatchTooLarge           = "batch_too_large"
+	CodeSenderNotPermitted      = "sender_not_permitted"
+	CodeUnauthenticated         = "unauthenticated"
+	CodeNotFound                = "not_found"
+	CodeMethodNotAllowed        = "method_not_allowed"
+	CodeMessageNotFound         = "message_not_found"
+	CodeMessageNotCancellable   = "message_not_cancellable"
+	CodeIdempotencyConflict     = "idempotency_key_reused_with_different_payload"
+	CodePayloadTooLarge         = "payload_too_large"
+	CodeUnsupportedMedia        = "unsupported_media_type"
+	CodeRateLimited             = "rate_limited"
+	CodeQueueHorizonExceeded    = "queue_horizon_exceeded"
+	CodeSenderUnavailable       = "sender_unavailable"
+	CodeSenderPoolExhausted     = "sender_pool_exhausted"
+	CodeSenderPoolMisconfigured = "sender_pool_misconfigured"
+	CodeInternalError           = "internal_error"
 )
 
 const problemTypeBase = "https://wa.internal/errors/"
@@ -39,25 +40,26 @@ type problemKind struct {
 }
 
 var problemKinds = map[string]problemKind{
-	CodeInvalidRequest:        {http.StatusBadRequest, "Invalid request", false},
-	CodeInvalidPhoneNumber:    {http.StatusBadRequest, "Invalid phone number", false},
-	CodeUnknownSender:         {http.StatusBadRequest, "Unknown sender", false},
-	CodeIdempotencyKeyReq:     {http.StatusBadRequest, "Idempotency key required", false},
-	CodeBatchTooLarge:         {http.StatusBadRequest, "Batch too large", false},
-	CodeSenderNotPermitted:    {http.StatusForbidden, "Sender not permitted for this key", false},
-	CodeUnauthenticated:       {http.StatusUnauthorized, "Not authenticated", false},
-	CodeNotFound:              {http.StatusNotFound, "Not found", false},
-	CodeMethodNotAllowed:      {http.StatusMethodNotAllowed, "Method not allowed", false},
-	CodeMessageNotFound:       {http.StatusNotFound, "Message not found", false},
-	CodeMessageNotCancellable: {http.StatusConflict, "Message can no longer be cancelled", false},
-	CodeIdempotencyConflict:   {http.StatusConflict, "Idempotency key reused with a different payload", false},
-	CodePayloadTooLarge:       {http.StatusRequestEntityTooLarge, "Payload too large", false},
-	CodeUnsupportedMedia:      {http.StatusUnsupportedMediaType, "Unsupported media type", false},
-	CodeRateLimited:           {http.StatusTooManyRequests, "Rate limit exceeded", true},
-	CodeQueueHorizonExceeded:  {http.StatusServiceUnavailable, "Sender backlog too deep", true},
-	CodeSenderUnavailable:     {http.StatusServiceUnavailable, "Sender temporarily unavailable", true},
-	CodeSenderPoolExhausted:   {http.StatusServiceUnavailable, "Sender pool exhausted", true},
-	CodeInternalError:         {http.StatusInternalServerError, "Internal error", true},
+	CodeInvalidRequest:          {http.StatusBadRequest, "Invalid request", false},
+	CodeInvalidPhoneNumber:      {http.StatusBadRequest, "Invalid phone number", false},
+	CodeUnknownSender:           {http.StatusBadRequest, "Unknown sender", false},
+	CodeIdempotencyKeyReq:       {http.StatusBadRequest, "Idempotency key required", false},
+	CodeBatchTooLarge:           {http.StatusBadRequest, "Batch too large", false},
+	CodeSenderNotPermitted:      {http.StatusForbidden, "Sender not permitted for this key", false},
+	CodeUnauthenticated:         {http.StatusUnauthorized, "Not authenticated", false},
+	CodeNotFound:                {http.StatusNotFound, "Not found", false},
+	CodeMethodNotAllowed:        {http.StatusMethodNotAllowed, "Method not allowed", false},
+	CodeMessageNotFound:         {http.StatusNotFound, "Message not found", false},
+	CodeMessageNotCancellable:   {http.StatusConflict, "Message can no longer be cancelled", false},
+	CodeIdempotencyConflict:     {http.StatusConflict, "Idempotency key reused with a different payload", false},
+	CodePayloadTooLarge:         {http.StatusRequestEntityTooLarge, "Payload too large", false},
+	CodeUnsupportedMedia:        {http.StatusUnsupportedMediaType, "Unsupported media type", false},
+	CodeRateLimited:             {http.StatusTooManyRequests, "Rate limit exceeded", true},
+	CodeQueueHorizonExceeded:    {http.StatusServiceUnavailable, "Sender backlog too deep", true},
+	CodeSenderUnavailable:       {http.StatusServiceUnavailable, "Sender temporarily unavailable", true},
+	CodeSenderPoolExhausted:     {http.StatusServiceUnavailable, "Sender pool exhausted", true},
+	CodeSenderPoolMisconfigured: {http.StatusInternalServerError, "Sender pool misconfigured", false},
+	CodeInternalError:           {http.StatusInternalServerError, "Internal error", true},
 }
 
 type fieldError struct {

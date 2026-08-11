@@ -1,8 +1,10 @@
 <?php
 
+use App\Http\Controllers\ApiKeysController;
 use App\Http\Controllers\MessagesController;
 use App\Http\Controllers\PoolsController;
 use App\Http\Controllers\SendController;
+use App\Http\Controllers\SendersController;
 use App\Http\Controllers\SessionsController;
 use Illuminate\Support\Facades\Route;
 
@@ -30,6 +32,14 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::delete('pools/{sender}/members/{sessionId}', [PoolsController::class, 'removeMember'])->name('pools.members.remove');
     Route::post('pools/{sender}/promote', [PoolsController::class, 'promote'])->name('pools.promote');
     Route::post('pools/{sender}/members/{sessionId}/reinstate', [PoolsController::class, 'reinstate'])->name('pools.reinstate');
+
+    Route::get('senders', [SendersController::class, 'index'])->name('senders');
+    Route::post('senders', [SendersController::class, 'store'])->name('senders.store');
+    Route::delete('senders/{sender}', [SendersController::class, 'destroy'])->name('senders.destroy');
+
+    Route::get('api-keys', [ApiKeysController::class, 'index'])->name('api-keys');
+    Route::post('api-keys', [ApiKeysController::class, 'store'])->name('api-keys.store');
+    Route::post('api-keys/{id}/revoke', [ApiKeysController::class, 'revoke'])->name('api-keys.revoke');
 });
 
 require __DIR__.'/settings.php';

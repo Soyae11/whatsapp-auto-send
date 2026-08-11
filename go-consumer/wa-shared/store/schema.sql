@@ -186,3 +186,27 @@ CREATE TABLE IF NOT EXISTS wa_sender_pools (
 
 CREATE UNIQUE INDEX IF NOT EXISTS wa_sender_pools_main_idx ON wa_sender_pools (sender)
   WHERE is_main;
+
+-- wa_senders replaces WA_SENDERS as the source of truth for which sender names exist. It is
+-- read by wa-consumer-api's senders.Cache (a poll-refreshed atomic.Pointer, not a query per
+-- request — see wa-shared/senders/cache.go) and written only through the /internal/senders
+-- admin routes, which wa-console calls on a user's behalf. owner_id is an opaque reference to
+-- a wa-console (Laravel) user id — this database has no foreign key to enforce it, since
+-- wa-console lives in a separate logical database (see docker/postgres/init).
+CREATE TABLE IF NOT EXISTS wa_senders (
+  name        TEXT PRIMARY KEY,
+  owner_id    TEXT NOT NULL,
+  mode        TEXT NOT NULL CHECK (mode IN ('single', 'pool')),
+  session_id  TEXT,
+  priority    INT NOT NULL DEFAULT 0,
+  dry_run     BOOLEAN NOT NULL DEFAULT false,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS wa_senders_owner_idx ON wa_senders (owner_id);
+
+-- Nullable: existing wa_api_keys rows predate ownership and are backfilled by hand once
+-- (see rollout notes). New rows created through /internal/keys always set it.
+ALTER TABLE wa_api_keys ADD COLUMN IF NOT EXISTS owner_id TEXT;
+
+CREATE INDEX IF NOT EXISTS wa_api_keys_owner_idx ON wa_api_keys (owner_id);
