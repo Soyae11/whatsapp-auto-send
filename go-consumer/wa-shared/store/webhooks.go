@@ -158,14 +158,22 @@ func scanEvent(sc interface{ Scan(...any) error }) (*WebhookEvent, error) {
 // SKIP LOCKED is what makes two workers safe here. Unlike a send, a duplicate webhook is
 // merely rude rather than a message to a real person twice — but the consumer contract says
 // events can repeat, so the guarantee only has to be good, not absolute.
+//
+// Disabled webhooks are filtered in the due set rather than in the final select. Filtering at the
+// end still claimed their events — bumping next_attempt_at on rows it then dropped — so they were
+// never delivered, never failed, never dead, and came back due every sweep, taking slots out of
+// every batch forever. DeadLetterDisabledEvents is what actually retires them.
 func (s *Store) ClaimDueEvents(ctx context.Context, now time.Time, lease time.Duration, limit int) ([]WebhookEvent, error) {
 	rows, err := s.pool.Query(ctx, `
 		WITH due AS (
-			SELECT id FROM wa_webhook_events
-			 WHERE status = $1 AND next_attempt_at <= $2
-			 ORDER BY next_attempt_at
+			SELECT e.id
+			  FROM wa_webhook_events e
+			  JOIN wa_webhooks w ON w.id = e.webhook_id
+			 WHERE e.status = $1 AND e.next_attempt_at <= $2
+			   AND w.disabled_at IS NULL
+			 ORDER BY e.next_attempt_at
 			 LIMIT $3
-			 FOR UPDATE SKIP LOCKED
+			 FOR UPDATE OF e SKIP LOCKED
 		), claimed AS (
 			UPDATE wa_webhook_events
 			   SET next_attempt_at = $2 + $4::interval
@@ -174,8 +182,7 @@ func (s *Store) ClaimDueEvents(ctx context.Context, now time.Time, lease time.Du
 		)
 		SELECT `+eventColumns+`
 		  FROM claimed e
-		  JOIN wa_webhooks w ON w.id = e.webhook_id
-		 WHERE w.disabled_at IS NULL`,
+		  JOIN wa_webhooks w ON w.id = e.webhook_id`,
 		EventPending, now, limit, lease.String())
 	if err != nil {
 		return nil, fmt.Errorf("store: claim due webhook events: %w", err)
@@ -225,6 +232,32 @@ func (s *Store) MarkEventFailed(ctx context.Context, id string, statusCode *int,
 		return fmt.Errorf("store: mark webhook event %s failed: %w", id, err)
 	}
 	return nil
+}
+
+// DisabledWebhookReason is the last_error left on an event retired because its webhook was
+// disabled before the event could be delivered. It reads back through the events endpoint and the
+// admin CLI, so it says why rather than leaving an operator to guess.
+const DisabledWebhookReason = "webhook was disabled before this event could be delivered"
+
+// DeadLetterDisabledEvents retires pending events whose webhook has since been disabled, and
+// returns how many went. Without it those events are simply never looked at again: ClaimDueEvents
+// skips them, nothing else moves them, and they stay pending in the table for good. Dead is the
+// honest state for them, and the reversible one — dead events are what the events endpoint and the
+// admin CLI list, and ReplayEvent can put one back on the queue if the webhook is ever turned back
+// on. attempts is left alone, since no attempt was ever made.
+func (s *Store) DeadLetterDisabledEvents(ctx context.Context, at time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE wa_webhook_events e
+		   SET status = $1, last_error = $2, next_attempt_at = $3
+		  FROM wa_webhooks w
+		 WHERE w.id = e.webhook_id
+		   AND e.status = $4
+		   AND w.disabled_at IS NOT NULL`,
+		EventDead, DisabledWebhookReason, at, EventPending)
+	if err != nil {
+		return 0, fmt.Errorf("store: dead-letter events of disabled webhooks: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // ReplayEvent puts a dead event back on the queue with a fresh attempt budget.

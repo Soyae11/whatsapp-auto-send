@@ -285,8 +285,8 @@ func (h *Handler) recordFailure(
 // cannot — resends the same message through whichever session Rotate found, because the text
 // is still sitting right here in p, not gone the way it is by the time a receipt arrives.
 //
-// Reports whether it handled the failure at all. false (no pool for this sender) means the
-// caller proceeds exactly as it always has.
+// Reports whether it handled the failure at all. false — no pool for this sender, or a failure
+// that does not indict the session — means the caller proceeds exactly as it always has.
 func (h *Handler) failoverPooled(
 	ctx context.Context,
 	log *slog.Logger,
@@ -296,6 +296,18 @@ func (h *Handler) failoverPooled(
 	v Verdict,
 ) bool {
 	if p.Sender == "" {
+		return false
+	}
+
+	// A failure that says nothing about the session must not cost the pool a member. A recipient
+	// who is not on WhatsApp, or a payload WhatsApp refuses, fails identically on every session,
+	// so resending it through a backup only buys a second failure — and each hop disqualifies
+	// another member until one mistyped phone number leaves the pool exhausted. TripsCircuit is
+	// already exactly this distinction ("a sick session from a bad request", see Verdict), so
+	// failover reuses it rather than keeping a second list of codes that could drift from it.
+	// Returning false hands these back to the ordinary path, which records them as the permanent,
+	// session-blameless failures they are.
+	if !v.TripsCircuit {
 		return false
 	}
 
@@ -318,10 +330,27 @@ func (h *Handler) failoverPooled(
 		}
 	}
 
-	backup, err := h.pools.Rotate(ctx, p.Sender, p.SessionID, h.isCircuitOpen(ctx))
+	isOpen := h.isCircuitOpen(ctx)
+	backup, err := h.pools.Rotate(ctx, p.Sender, p.SessionID, isOpen)
 	if err != nil {
 		log.Error("could not rotate pool after a send failure", "sender", p.Sender, "error", err)
 		return true
+	}
+
+	// Rotate's "" covers two situations that could not be further apart, and only one is fatal.
+	// If the failed session was main, "" means nothing was eligible to take over and the pool
+	// really is out of options. If it was a load-spread backup, Rotate disqualified it alone and
+	// deliberately left main standing — there is somewhere to send, Rotate simply has no
+	// promotion to report and says so in its doc comment ("a caller that still wants to try a
+	// fresh send picks among the pool's remaining eligible members itself"). Without this, a
+	// message routed to a backup by load spreading was dropped with a healthy main right there.
+	if backup == "" {
+		remaining, err := h.pools.Pool(ctx, p.Sender)
+		if err != nil {
+			log.Error("could not re-read pool after rotating", "sender", p.Sender, "error", err)
+			return true
+		}
+		backup, _ = store.PickHealthyMember(remaining, p.SessionID, isOpen)
 	}
 	if backup == "" {
 		log.Error("pool has no session eligible to take over", "alert", true, "sender", p.Sender, "error_code", code)

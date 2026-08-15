@@ -154,6 +154,19 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
+// MarkScheduled records a job on its way into the queue. A key that already has a row is normally
+// left alone — it is either in flight or finished, and this call is a duplicate enqueue that
+// asynq will reject on task id a moment later.
+//
+// The exception is a row sitting at 'failed'. Enqueue writes that row itself, through
+// markUnqueued, when the job was recorded but never reached asynq; the caller is then free to
+// retry, and does so carrying a public id minted fresh for the new attempt. Leaving the old row
+// untouched there stranded the caller: the API answered with the new id while the row kept the
+// old one, so the message really did send but could never be looked up, and its webhooks named an
+// id the caller had never seen. Taking the row over re-points it at the attempt now under way,
+// and clears the previous attempt's failure so a row reading 'scheduled' does not still carry the
+// error and failed_at that contradict it. attempts is left as it is — wa_job_attempts is the
+// history, and this is not a new message, only a new try at the same one.
 func (s *Store) MarkScheduled(ctx context.Context, j Job, scheduledFor time.Time) error {
 	metadata, err := marshalMetadata(j.Metadata)
 	if err != nil {
@@ -163,10 +176,25 @@ func (s *Store) MarkScheduled(ctx context.Context, j Job, scheduledFor time.Time
 		INSERT INTO wa_jobs (idempotency_key, session_id, to_number, source_ref, status, scheduled_for,
 		                     public_id, api_key_id, sender, priority, metadata, failover_of)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-		ON CONFLICT (idempotency_key) DO NOTHING`,
+		ON CONFLICT (idempotency_key) DO UPDATE
+		   SET status         = EXCLUDED.status,
+		       scheduled_for  = EXCLUDED.scheduled_for,
+		       session_id     = EXCLUDED.session_id,
+		       to_number      = EXCLUDED.to_number,
+		       source_ref     = COALESCE(EXCLUDED.source_ref, wa_jobs.source_ref),
+		       public_id      = COALESCE(EXCLUDED.public_id, wa_jobs.public_id),
+		       api_key_id     = COALESCE(EXCLUDED.api_key_id, wa_jobs.api_key_id),
+		       sender         = COALESCE(EXCLUDED.sender, wa_jobs.sender),
+		       priority       = COALESCE(EXCLUDED.priority, wa_jobs.priority),
+		       metadata       = COALESCE(EXCLUDED.metadata, wa_jobs.metadata),
+		       failover_of    = COALESCE(EXCLUDED.failover_of, wa_jobs.failover_of),
+		       last_error_code = NULL,
+		       last_error_at   = NULL,
+		       failed_at       = NULL
+		 WHERE wa_jobs.status = $13`,
 		j.IdempotencyKey, j.SessionID, j.To, nullable(j.SourceRef), StatusScheduled, scheduledFor,
 		nullable(j.PublicID), nullable(j.APIKeyID), nullable(j.Sender), nullable(j.Priority), metadata,
-		nullable(j.FailoverOf))
+		nullable(j.FailoverOf), StatusFailed)
 	if err != nil {
 		return fmt.Errorf("store: mark scheduled %s: %w", j.IdempotencyKey, err)
 	}

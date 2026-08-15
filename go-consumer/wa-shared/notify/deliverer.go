@@ -58,6 +58,7 @@ type Queue interface {
 	ClaimDueEvents(ctx context.Context, now time.Time, lease time.Duration, limit int) ([]store.WebhookEvent, error)
 	MarkEventDelivered(ctx context.Context, id string, statusCode int, at time.Time) error
 	MarkEventFailed(ctx context.Context, id string, statusCode *int, reason string, retryAt time.Time, dead bool) error
+	DeadLetterDisabledEvents(ctx context.Context, at time.Time) (int64, error)
 }
 
 type Deliverer struct {
@@ -102,6 +103,16 @@ func (d *Deliverer) Run(ctx context.Context) {
 
 // Tick delivers one batch of due events.
 func (d *Deliverer) Tick(ctx context.Context) error {
+	// Retiring events whose webhook was disabled is not delivery work, but this is the only loop
+	// that runs on the queue, and leaving them pending means leaving them forever. It runs first
+	// so a batch is never sized around events that are about to be retired anyway. A failure here
+	// must not cost us the sweep: the delivery below is the job that matters.
+	if retired, err := d.queue.DeadLetterDisabledEvents(ctx, d.now()); err != nil {
+		d.log.Error("could not retire events of disabled webhooks", "error", err)
+	} else if retired > 0 {
+		d.log.Info("retired events of disabled webhooks", "count", retired)
+	}
+
 	events, err := d.queue.ClaimDueEvents(ctx, d.now(), ClaimLease, BatchSize)
 	if err != nil {
 		return err

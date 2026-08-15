@@ -393,11 +393,13 @@ func (s *Server) underIdempotency(w http.ResponseWriter, r *http.Request, caller
 		return
 	}
 
-	ctx, cancel := contextWithTimeout(r, 5*time.Second)
+	// Scoped to the claim alone, and deliberately not reused afterwards: work() runs between the
+	// claim and the record, and a batch of a hundred messages takes far longer than this budget.
+	claimCtx, cancel := contextWithTimeout(r, 5*time.Second)
 	defer cancel()
 
 	hash := store.HashRequest(body)
-	replay, err := s.idempotency.ClaimIdempotencyKey(ctx, key.ID, callerKey, hash)
+	replay, err := s.idempotency.ClaimIdempotencyKey(claimCtx, key.ID, callerKey, hash)
 	switch {
 	case errors.Is(err, store.ErrIdempotencyConflict):
 		s.log.Warn("idempotency key reused with a different payload",
@@ -443,10 +445,20 @@ func (s *Server) underIdempotency(w http.ResponseWriter, r *http.Request, caller
 		return
 	}
 
-	if err := s.idempotency.RecordIdempotentResponse(ctx, key.ID, callerKey, status, encoded); err != nil {
+	// A context of its own, on two counts. It must not inherit claimCtx's budget, which was spent
+	// on the claim and on work() and is long gone by now — a batch send would record nothing and
+	// leave the claim stranded with no response, which is the one state that answers every later
+	// retry with "still being processed". And it must outlive the request, because a caller that
+	// hung up still needs its key to end up replayable rather than stuck.
+	recCtx, recCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+	defer recCancel()
+
+	if err := s.idempotency.RecordIdempotentResponse(recCtx, key.ID, callerKey, status, encoded); err != nil {
 		// The work is done and the message is queued. Failing the response here would
-		// invite a retry that sends nothing new but reports failure, so answer normally
-		// and let the claim expire.
+		// invite a retry that sends nothing new but reports failure, so answer normally.
+		// The claim is left behind deliberately: it stops a retry re-sending while this
+		// request is still in the air, and store.IdempotencyInFlightTimeout caps how long
+		// an unrecorded one can block the key.
 		s.log.Error("could not record the idempotent response",
 			"request_id", requestIDFrom(r.Context()), "api_key_id", key.ID, "idempotency_key", callerKey, "error", err)
 	}
@@ -510,8 +522,9 @@ func (s *Server) dryRunRequested(w http.ResponseWriter, r *http.Request, sender 
 // A logged-out session is itself a failure signal — for a pooled sender it is treated exactly
 // like a failed send would be (see rotatePoolAfterFailure and the dispatcher's synchronous
 // path): this discovers the failure proactively, before ever queueing, rather than reactively
-// after a doomed send attempt. On a successful rotation, sender.SessionID is updated in place
-// so the caller's plan uses the newly promoted session.
+// after a doomed send attempt. When the pool still has a usable session — one promoted into
+// main's place, or the main that was never in trouble because load spreading had merely routed
+// this send to a backup — sender.SessionID is updated in place so the caller's plan uses it.
 func (s *Server) senderCanSend(w http.ResponseWriter, r *http.Request, sender *senders.Sender) bool {
 	if s.sessions == nil {
 		return true
@@ -531,16 +544,12 @@ func (s *Server) senderCanSend(w http.ResponseWriter, r *http.Request, sender *s
 	}
 
 	if s.pools != nil && sender.Mode == senders.ModePool {
-		promotedTo, err := s.pools.Rotate(ctx, sender.Name, sender.SessionID, s.isCircuitOpen(ctx))
-		if err != nil {
-			s.log.Error("could not rotate pool for a logged-out sender",
-				"request_id", requestIDFrom(r.Context()), "sender", sender.Name, "error", err)
-		} else if promotedTo != "" {
+		if next, ok := s.rotateToHealthyMember(ctx, sender.Name, sender.SessionID); ok {
 			s.log.Warn("sender logged out at send time, pool rotated",
 				"alert", true,
 				"request_id", requestIDFrom(r.Context()),
-				"sender", sender.Name, "session_id", sender.SessionID, "promoted_to", promotedTo)
-			sender.SessionID = promotedTo
+				"sender", sender.Name, "session_id", sender.SessionID, "rotated_to", next)
+			sender.SessionID = next
 			return true
 		}
 	}

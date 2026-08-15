@@ -18,6 +18,9 @@ import (
 //go:embed breaker.lua
 var failureScript string
 
+//go:embed open.lua
+var openScript string
+
 const KeyPrefix = "wa:circuit:"
 
 const (
@@ -62,11 +65,12 @@ type QueueInspector interface {
 }
 
 type Breaker struct {
-	rdb       redis.Cmdable
-	inspector QueueInspector
-	script    *redis.Script
-	cfg       Config
-	log       *slog.Logger
+	rdb        redis.Cmdable
+	inspector  QueueInspector
+	script     *redis.Script
+	openScript *redis.Script
+	cfg        Config
+	log        *slog.Logger
 }
 
 func New(rdb redis.Cmdable, inspector QueueInspector, cfg Config, log *slog.Logger) (*Breaker, error) {
@@ -81,11 +85,12 @@ func New(rdb redis.Cmdable, inspector QueueInspector, cfg Config, log *slog.Logg
 	}
 
 	return &Breaker{
-		rdb:       rdb,
-		inspector: inspector,
-		script:    redis.NewScript(failureScript),
-		cfg:       cfg,
-		log:       log,
+		rdb:        rdb,
+		inspector:  inspector,
+		script:     redis.NewScript(failureScript),
+		openScript: redis.NewScript(openScript),
+		cfg:        cfg,
+		log:        log,
 	}, nil
 }
 
@@ -159,6 +164,15 @@ func (b *Breaker) Success(ctx context.Context, sessionID string) error {
 	return nil
 }
 
+// Open opens a session's circuit and reports whether this call is what changed the state.
+//
+// A circuit that is already open is normally left exactly as it is. The exception is a manual
+// pause, which takes over a circuit the breaker had tripped by itself: the two look identical
+// from the queues' side, but only one survives the watcher. Watcher.evaluate closes any circuit
+// whose reason is not ReasonManual once the session polls healthy again, so a pause that failed to
+// overwrite an automatic reason would be undone a few polls later — the session resumes sending
+// while an operator has every reason to believe they stopped it. The takeover is one-way: nothing
+// automatic overwrites a manual pause, which continues to need an explicit Close.
 func (b *Breaker) Open(ctx context.Context, sessionID, reason, errorCode string) (opened bool, err error) {
 	if sessionID == "" {
 		return false, errors.New("circuit: empty session id")
@@ -176,13 +190,18 @@ func (b *Breaker) Open(ctx context.Context, sessionID, reason, errorCode string)
 		return false, fmt.Errorf("circuit: encode state: %w", err)
 	}
 
-	set, err := b.rdb.SetNX(ctx, StateKey(sessionID), encoded, 0).Result()
+	set, err := b.openScript.Run(ctx, b.rdb,
+		[]string{StateKey(sessionID)},
+		encoded,
+		reason,
+		ReasonManual,
+	).Int()
 	if err != nil {
 		return false, fmt.Errorf("circuit: open %s: %w", sessionID, err)
 	}
 
 	b.ensurePaused(sessionID)
-	if set {
+	if set == 1 {
 		b.log.Error("circuit opened",
 			"alert", true,
 			"session_id", sessionID,
@@ -190,7 +209,7 @@ func (b *Breaker) Open(ctx context.Context, sessionID, reason, errorCode string)
 			"error_code", errorCode,
 			"queues", tasks.QueuesFor(sessionID))
 	}
-	return set, nil
+	return set == 1, nil
 }
 
 func (b *Breaker) Close(ctx context.Context, sessionID string) (closed bool, err error) {

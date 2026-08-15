@@ -129,3 +129,39 @@ func ErrorCode(err error) string {
 	}
 	return ""
 }
+
+// FaultsSession reports whether a failure indicts the session that carried it, rather than the
+// request it was carrying. The distinction drives three separate decisions — whether to count the
+// failure against a session's circuit breaker, whether to fail a sender's pool over to another
+// session, and whether a rejection receipt should rotate a pool — so it is defined once here
+// instead of once per caller, where the copies would drift and a session could end up disqualified
+// by one rule while another still considered it healthy.
+//
+// Only failures that would repeat identically on any session are the request's fault: a recipient
+// who is not on WhatsApp, a payload WhatsApp will not accept. Everything else, including an
+// unrecognised error, counts against the session — an unexplained failure is the session's problem
+// until something says otherwise, which is the safe direction to be wrong in.
+func FaultsSession(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch {
+	case errors.Is(err, ErrNotOnWhatsApp),
+		errors.Is(err, ErrInvalidPayload),
+		errors.Is(err, ErrPayloadTooLarge),
+		errors.Is(err, ErrUnsupportedMediaType):
+		return false
+	default:
+		return true
+	}
+}
+
+// FaultsSessionCode is FaultsSession for callers holding only a wire error code — a rejection
+// receipt, say, where the original error object is long gone. An unknown or empty code takes the
+// same "assume the session" default FaultsSession gives an unrecognised error.
+func FaultsSessionCode(code string) bool {
+	if sentinel, known := sentinelByCode[code]; known {
+		return FaultsSession(sentinel)
+	}
+	return true
+}

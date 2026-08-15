@@ -27,7 +27,9 @@ type Verdict struct {
 
 	// TripsCircuit separates a sick session from a bad request. A recipient who is not on
 	// WhatsApp says nothing about the socket, and five of them in a row must not pause a
-	// healthy session's queues.
+	// healthy session's queues — nor cost a pooled sender a member (see failoverPooled).
+	// Set by Classify from wa.FaultsSession, never by the table below: the same distinction is
+	// needed on paths that only ever see an error code, so it lives in one place for all of them.
 	TripsCircuit bool
 }
 
@@ -40,21 +42,28 @@ var (
 // Classify consults the table first, then lets wa-gateway veto a retry: the service returns
 // an explicit retryable flag and rule 3 says trust it. Neither source alone is enough — the
 // table cannot know about codes added later, and the flag cannot know how long to wait.
+//
+// Whose fault the failure was is a separate question from what to do about it, and one the
+// receipt path in wa-consumer-api has to answer too without ever holding an error, so it comes
+// from wa.FaultsSession rather than the table.
 func Classify(err error) Verdict {
 	v := classify(err)
+	v.TripsCircuit = wa.FaultsSession(err)
 	if !wa.IsRetryable(err) {
 		v.Retryable = false
 	}
 	return v
 }
 
+// classify decides only retryability, alerting, and how long to wait. TripsCircuit is left zero
+// here on purpose — Classify fills it in; see Verdict.
 func classify(err error) Verdict {
 	switch {
 	case err == nil:
 		return Verdict{}
 
 	case errors.Is(err, wa.ErrSessionLoggedOut):
-		return Verdict{Alert: true, TripsCircuit: true}
+		return Verdict{Alert: true}
 
 	case errors.Is(err, wa.ErrNotOnWhatsApp):
 		return Verdict{}
@@ -66,22 +75,22 @@ func classify(err error) Verdict {
 
 	case errors.Is(err, wa.ErrUnauthorized),
 		errors.Is(err, wa.ErrSessionNotFound):
-		return Verdict{Alert: true, TripsCircuit: true}
+		return Verdict{Alert: true}
 
 	case errors.Is(err, wa.ErrSessionNotConnected):
-		return Verdict{Retryable: true, TripsCircuit: true, Backoff: backoffDisconnected}
+		return Verdict{Retryable: true, Backoff: backoffDisconnected}
 
 	case errors.Is(err, wa.ErrRateLimited):
-		return Verdict{Retryable: true, TripsCircuit: true, Backoff: backoffRateLimited}
+		return Verdict{Retryable: true, Backoff: backoffRateLimited}
 
 	case errors.Is(err, wa.ErrSendFailed),
 		errors.Is(err, wa.ErrSendInProgress),
 		errors.Is(err, wa.ErrUpstreamTimeout),
 		errors.Is(err, wa.ErrInternal):
-		return Verdict{Retryable: true, TripsCircuit: true, Backoff: backoffDefault}
+		return Verdict{Retryable: true, Backoff: backoffDefault}
 
 	default:
-		return Verdict{Retryable: true, TripsCircuit: true, Backoff: backoffDefault}
+		return Verdict{Retryable: true, Backoff: backoffDefault}
 	}
 }
 

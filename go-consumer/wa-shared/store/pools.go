@@ -241,8 +241,26 @@ func (s *Store) RemoveMember(ctx context.Context, sender, sessionID string) erro
 // selection logic; each passes its own circuit-breaker check as isOpen. members is expected in
 // rank order, as returned by Pool.
 func PickHealthyBackup(members []PoolMember, excludeSessionID string, isOpen func(sessionID string) bool) (sessionID string, ok bool) {
+	return pickHealthy(members, excludeSessionID, isOpen, true)
+}
+
+// PickHealthyMember answers the other question a caller can have after a failure: not "who
+// should take over as main" but "is there anywhere left to send this". Same eligibility rules as
+// PickHealthyBackup except that main counts — a caller holding a message that still needs to go
+// out is perfectly happy with the main already sitting there, and only a promotion has reason to
+// exclude it. Rotate's "" is ambiguous on its own (see its doc comment); re-reading the pool and
+// asking this instead is how a caller tells "pool exhausted" from "a load-spread backup went
+// down and main is fine".
+func PickHealthyMember(members []PoolMember, excludeSessionID string, isOpen func(sessionID string) bool) (sessionID string, ok bool) {
+	return pickHealthy(members, excludeSessionID, isOpen, false)
+}
+
+func pickHealthy(members []PoolMember, excludeSessionID string, isOpen func(sessionID string) bool, skipMain bool) (string, bool) {
 	for _, m := range members {
-		if m.SessionID == excludeSessionID || m.IsMain || m.Disqualified {
+		if m.SessionID == excludeSessionID || m.Disqualified {
+			continue
+		}
+		if skipMain && m.IsMain {
 			continue
 		}
 		if isOpen != nil && isOpen(m.SessionID) {

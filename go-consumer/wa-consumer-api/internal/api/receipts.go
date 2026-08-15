@@ -104,12 +104,13 @@ func (s *Server) handleGatewayEvent(w http.ResponseWriter, r *http.Request) {
 		s.emitter.EmitForRow(ctx, *row)
 	}
 
-	// A rejection is exactly the case `sent` was a lie about — it means the session that sent
-	// this message just failed, so its pool (if it has one) rotates. No resend: the text isn't
-	// kept anywhere by the time a receipt arrives, only the pool moves for future sends. See
-	// the dispatcher's synchronous path for the one case that does resend.
+	// A rejection is exactly the case `sent` was a lie about — it may mean the session that sent
+	// this message just failed, so its pool (if it has one) rotates. Only if the rejection is the
+	// session's fault, though; rotatePoolAfterFailure weighs errorCode for that. No resend: the
+	// text isn't kept anywhere by the time a receipt arrives, only the pool moves for future
+	// sends. See the dispatcher's synchronous path for the one case that does resend.
 	if changed && kind == store.ReceiptFailed && row.Sender != "" {
-		s.rotatePoolAfterFailure(ctx, row.Sender, row.SessionID)
+		s.rotatePoolAfterFailure(ctx, row.Sender, row.SessionID, errorCode)
 	}
 
 	s.log.Info("receipt applied",

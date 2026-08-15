@@ -5,6 +5,8 @@ import (
 	"errors"
 
 	"wa-shared/senders"
+	"wa-shared/store"
+	"wa-shared/wa"
 )
 
 // errSenderPoolExhausted means the sender has a pool but no member currently qualifies as
@@ -89,8 +91,17 @@ func (s *Server) resolveSendSession(ctx context.Context, sender senders.Sender) 
 // path (a post-sent rejection) — it can only ever rotate, never resend the rejected message
 // itself (its text is long gone by the time a receipt arrives). See the dispatcher's
 // synchronous path for the one case that does resend.
-func (s *Server) rotatePoolAfterFailure(ctx context.Context, sender, failedSessionID string) {
+//
+// errorCode is the rejection's reason, and only reasons that indict the session rotate anything.
+// A receipt saying the recipient is not on WhatsApp is about that phone number, not the socket
+// that carried it; rotating on one would disqualify a healthy member per bad number until the
+// pool is exhausted. The synchronous path gates on the same question via Verdict.TripsCircuit —
+// wa.FaultsSession is what they share, since a receipt never has an error to classify.
+func (s *Server) rotatePoolAfterFailure(ctx context.Context, sender, failedSessionID, errorCode string) {
 	if s.pools == nil {
+		return
+	}
+	if !wa.FaultsSessionCode(errorCode) {
 		return
 	}
 	if known, err := s.senders.Load().Get(sender); err != nil || known.Mode != senders.ModePool {
@@ -100,6 +111,32 @@ func (s *Server) rotatePoolAfterFailure(ctx context.Context, sender, failedSessi
 		s.log.Error("could not rotate pool after a send failure",
 			"sender", sender, "session_id", failedSessionID, "error", err)
 	}
+}
+
+// rotateToHealthyMember rotates sender's pool away from failedSessionID and reports which session
+// should serve the send instead. Rotate alone cannot answer that: it returns "" both when the
+// pool is genuinely out of options and when failedSessionID was only a load-spread backup, which
+// it disqualifies while leaving a perfectly healthy main standing. Re-reading the pool afterwards
+// collapses the two into the question the caller actually has — is there anywhere left to send?
+func (s *Server) rotateToHealthyMember(ctx context.Context, sender, failedSessionID string) (string, bool) {
+	isOpen := s.isCircuitOpen(ctx)
+
+	promotedTo, err := s.pools.Rotate(ctx, sender, failedSessionID, isOpen)
+	if err != nil {
+		s.log.Error("could not rotate pool for a logged-out sender",
+			"sender", sender, "session_id", failedSessionID, "error", err)
+		return "", false
+	}
+	if promotedTo != "" {
+		return promotedTo, true
+	}
+
+	members, err := s.pools.Pool(ctx, sender)
+	if err != nil {
+		s.log.Error("could not re-read pool after rotating", "sender", sender, "error", err)
+		return "", false
+	}
+	return store.PickHealthyMember(members, failedSessionID, isOpen)
 }
 
 // isCircuitOpen adapts the circuit breaker to PickHealthyBackup's isOpen callback shape.
