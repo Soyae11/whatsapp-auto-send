@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"wa-shared/store"
@@ -33,6 +34,24 @@ const (
 
 	BatchSize = 20
 
+	// RetireInterval paces the disabled-webhook sweep, which is housekeeping rather than
+	// delivery. Emitter.Emit already refuses to queue for a disabled webhook, so nothing is
+	// added to the backlog after the moment it is disabled; running the sweep on every delivery
+	// tick would be a scan every five seconds to update nothing.
+	RetireInterval = time.Minute
+
+	// RetireBatchSize bounds one statement, so a large backlog is retired over several of them
+	// instead of one long-running UPDATE holding locks across the table.
+	RetireBatchSize = 200
+
+	// MaxRetirePasses bounds one sweep, which keeps going until the backlog is drained. The
+	// batch size alone is not a throughput limit and must not become one: a webhook disabled
+	// with a large backlog has all of it to retire at once, and one batch per RetireInterval
+	// would take hours to work through what a single sweep clears in seconds. The cap is only
+	// here so a sweep cannot run forever if events are somehow arriving as fast as it retires
+	// them — the next tick picks up wherever it left off.
+	MaxRetirePasses = 500
+
 	backoffBase = 30 * time.Second
 	backoffCap  = 30 * time.Minute
 )
@@ -58,7 +77,7 @@ type Queue interface {
 	ClaimDueEvents(ctx context.Context, now time.Time, lease time.Duration, limit int) ([]store.WebhookEvent, error)
 	MarkEventDelivered(ctx context.Context, id string, statusCode int, at time.Time) error
 	MarkEventFailed(ctx context.Context, id string, statusCode *int, reason string, retryAt time.Time, dead bool) error
-	DeadLetterDisabledEvents(ctx context.Context, at time.Time) (int64, error)
+	DeadLetterDisabledEvents(ctx context.Context, at time.Time, limit int) (int64, error)
 }
 
 type Deliverer struct {
@@ -77,8 +96,18 @@ func NewDeliverer(queue Queue, log *slog.Logger) *Deliverer {
 	}
 }
 
-// Run polls until the context is cancelled. It is safe to run more than one.
+// Run polls until the context is cancelled, and runs the disabled-webhook sweep alongside on its
+// own slower schedule. It is safe to run more than one, here or in another process: ClaimDueEvents
+// leases what it hands out, and the sweep's statement takes its rows with SKIP LOCKED.
 func (d *Deliverer) Run(ctx context.Context) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.runRetireSweeps(ctx)
+	}()
+	defer wg.Wait()
+
 	ticker := time.NewTicker(PollInterval)
 	defer ticker.Stop()
 
@@ -103,16 +132,6 @@ func (d *Deliverer) Run(ctx context.Context) {
 
 // Tick delivers one batch of due events.
 func (d *Deliverer) Tick(ctx context.Context) error {
-	// Retiring events whose webhook was disabled is not delivery work, but this is the only loop
-	// that runs on the queue, and leaving them pending means leaving them forever. It runs first
-	// so a batch is never sized around events that are about to be retired anyway. A failure here
-	// must not cost us the sweep: the delivery below is the job that matters.
-	if retired, err := d.queue.DeadLetterDisabledEvents(ctx, d.now()); err != nil {
-		d.log.Error("could not retire events of disabled webhooks", "error", err)
-	} else if retired > 0 {
-		d.log.Info("retired events of disabled webhooks", "count", retired)
-	}
-
 	events, err := d.queue.ClaimDueEvents(ctx, d.now(), ClaimLease, BatchSize)
 	if err != nil {
 		return err
@@ -124,6 +143,63 @@ func (d *Deliverer) Tick(ctx context.Context) error {
 		d.deliver(ctx, e)
 	}
 	return nil
+}
+
+// runRetireSweeps paces the sweep on a ticker of its own rather than counting elapsed time inside
+// the delivery tick. The pacing is then held by the runtime instead of by a field on Deliverer,
+// which is what lets Run stay reentrant — and a sweep that overruns its interval delays the next
+// sweep rather than a delivery.
+//
+// A failure never stops the loop: delivery is the job that matters, and the sweep comes round
+// again a minute later.
+func (d *Deliverer) runRetireSweeps(ctx context.Context) {
+	ticker := time.NewTicker(RetireInterval)
+	defer ticker.Stop()
+
+	for {
+		if retired, err := d.RetireSweep(ctx); err != nil {
+			if ctx.Err() == nil {
+				d.log.Error("could not retire events of disabled webhooks",
+					"retired", retired, "error", err)
+			}
+		} else if retired > 0 {
+			d.log.Info("retired events of disabled webhooks", "count", retired)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// RetireSweep retires events whose webhook has since been disabled, in batches, until the backlog
+// is drained or MaxRetirePasses is spent. It returns how many went.
+//
+// Sweeping is the only thing that can move these events: ClaimDueEvents skips them, so leaving
+// them pending means leaving them forever. The loop is what makes the batch bound a statement
+// size rather than a rate — a webhook disabled with a hundred thousand events queued behind it
+// has all of them to retire in one go, and doing 200 a minute would still be at it hours later.
+func (d *Deliverer) RetireSweep(ctx context.Context) (int64, error) {
+	var total int64
+	for range MaxRetirePasses {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+
+		retired, err := d.queue.DeadLetterDisabledEvents(ctx, d.now(), RetireBatchSize)
+		total += retired
+		if err != nil {
+			return total, err
+		}
+		// A short batch means the sweep has caught up: either the backlog is gone, or what is
+		// left is not due yet and belongs to the next pass.
+		if retired < RetireBatchSize {
+			return total, nil
+		}
+	}
+	return total, nil
 }
 
 func (d *Deliverer) deliver(ctx context.Context, e store.WebhookEvent) {

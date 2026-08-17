@@ -26,10 +26,10 @@ type Verdict struct {
 	Backoff   Backoff
 
 	// TripsCircuit separates a sick session from a bad request. A recipient who is not on
-	// WhatsApp says nothing about the socket, and five of them in a row must not pause a
-	// healthy session's queues — nor cost a pooled sender a member (see failoverPooled).
-	// Set by Classify from wa.FaultsSession, never by the table below: the same distinction is
-	// needed on paths that only ever see an error code, so it lives in one place for all of them.
+	// WhatsApp says nothing about the socket, and five of them in a row must not pause a healthy
+	// session's queues — nor cost a pooled sender a member (see failoverPooled). Classify sets it
+	// from wa.FaultsSession, never the table below, because paths that only ever see an error
+	// code need the same distinction.
 	TripsCircuit bool
 }
 
@@ -43,9 +43,8 @@ var (
 // an explicit retryable flag and rule 3 says trust it. Neither source alone is enough — the
 // table cannot know about codes added later, and the flag cannot know how long to wait.
 //
-// Whose fault the failure was is a separate question from what to do about it, and one the
-// receipt path in wa-consumer-api has to answer too without ever holding an error, so it comes
-// from wa.FaultsSession rather than the table.
+// Whose fault the failure was is a separate question from what to do about it, so it comes from
+// wa.FaultsSession rather than the table.
 func Classify(err error) Verdict {
 	v := classify(err)
 	v.TripsCircuit = wa.FaultsSession(err)

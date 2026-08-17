@@ -106,12 +106,32 @@ func (s *Store) CurrentMain(ctx context.Context, sender string) (sessionID strin
 	if len(members) == 0 {
 		return "", false, nil
 	}
-	for _, m := range members {
-		if m.IsMain {
-			return m.SessionID, true, nil
-		}
+	if main, ok := MainOf(members); ok {
+		return main.SessionID, true, nil
 	}
 	return "", true, nil
+}
+
+// MainOf returns the member currently holding main. Pure, and the one place that answers the
+// question — CurrentMain, Rotate and wa-consumer-api's routing all used to scan for IsMain
+// themselves, and a hand-written scan cannot distinguish "this session is a backup" from "this
+// session is not in the pool at all", which is how a stale session id ends up quietly taking a
+// caller's not-main branch. The bool separates those: false means no member holds main.
+func MainOf(members []PoolMember) (PoolMember, bool) {
+	for _, m := range members {
+		if m.IsMain {
+			return m, true
+		}
+	}
+	return PoolMember{}, false
+}
+
+// IsMain reports whether sessionID is the member currently holding main. It is false for a
+// backup and false for a session the pool has never heard of; a caller that needs to tell those
+// apart wants MainOf.
+func IsMain(members []PoolMember, sessionID string) bool {
+	main, ok := MainOf(members)
+	return ok && main.SessionID == sessionID
 }
 
 // Promote makes newMainSessionID the sender's main, dethroning whichever session holds it now
@@ -121,30 +141,67 @@ func (s *Store) CurrentMain(ctx context.Context, sender string) (sessionID strin
 // override. Both updates happen in one transaction; the partial unique index on is_main means
 // two concurrent promotions can't both win.
 func (s *Store) Promote(ctx context.Context, sender, newMainSessionID string) error {
+	return s.moveMain(ctx, sender, newMainSessionID, true)
+}
+
+// Handover moves main to newMainSessionID without retiring whoever held it. It is the
+// health-driven counterpart to Promote: the old main was found logged out by a status probe, not
+// caught failing a send, and a status read is far too weak a signal to disqualify on — a
+// wa-gateway restart reports logged_out for every session for a few seconds, and Promote's
+// dethrone would turn that blip into a pool of permanently disqualified members that only
+// Reinstate can undo.
+//
+// Moving the crown alone is the safe way to be wrong: a dethroned member that really is logged
+// out stays eligible, but the next status probe skips it again, and the first send it actually
+// fails disqualifies it for real. Nothing else about either member changes — in particular a
+// disqualified member is never resurrected here, since callers only ever hand over to one they
+// just found eligible and connected.
+func (s *Store) Handover(ctx context.Context, sender, newMainSessionID string) error {
+	return s.moveMain(ctx, sender, newMainSessionID, false)
+}
+
+// moveMain is the transaction both Promote and Handover are. They differ by exactly one thing —
+// whether the session losing main is retired on the way out — so they share this rather than
+// keeping two copies that must be changed in lockstep. retireOldMain also clears disqualified on
+// the incoming main, because the two flags express one decision: a promotion is a judgement about
+// which member deserves to serve, and a handover is only a judgement about which one is reachable
+// right now.
+//
+// The partial unique index on is_main is what makes this safe under concurrency: two callers
+// moving main at once cannot both win, and the loser's transaction fails rather than leaving the
+// pool with two mains.
+func (s *Store) moveMain(ctx context.Context, sender, newMainSessionID string, retireOldMain bool) error {
+	op := "hand over main in"
+	if retireOldMain {
+		op = "promote main in"
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("store: promote %s in %s: %w", newMainSessionID, sender, err)
+		return fmt.Errorf("store: %s %s to %s: %w", op, sender, newMainSessionID, err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
 	if _, err := tx.Exec(ctx, `
-		UPDATE wa_sender_pools SET is_main = false, disqualified = true, updated_at = now()
-		 WHERE sender = $1 AND is_main`, sender); err != nil {
-		return fmt.Errorf("store: promote %s in %s: dethrone old main: %w", newMainSessionID, sender, err)
+		UPDATE wa_sender_pools
+		   SET is_main = false, disqualified = disqualified OR $2, updated_at = now()
+		 WHERE sender = $1 AND is_main`, sender, retireOldMain); err != nil {
+		return fmt.Errorf("store: %s %s: dethrone old main: %w", op, sender, err)
 	}
 
 	tag, err := tx.Exec(ctx, `
-		UPDATE wa_sender_pools SET is_main = true, disqualified = false, updated_at = now()
-		 WHERE sender = $1 AND session_id = $2`, sender, newMainSessionID)
+		UPDATE wa_sender_pools
+		   SET is_main = true, disqualified = disqualified AND NOT $3, updated_at = now()
+		 WHERE sender = $1 AND session_id = $2`, sender, newMainSessionID, retireOldMain)
 	if err != nil {
-		return fmt.Errorf("store: promote %s in %s: %w", newMainSessionID, sender, err)
+		return fmt.Errorf("store: %s %s to %s: %w", op, sender, newMainSessionID, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("%w: %s has no member %s", ErrPoolNotFound, sender, newMainSessionID)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("store: promote %s in %s: %w", newMainSessionID, sender, err)
+		return fmt.Errorf("store: %s %s to %s: %w", op, sender, newMainSessionID, err)
 	}
 	return nil
 }
@@ -244,29 +301,43 @@ func PickHealthyBackup(members []PoolMember, excludeSessionID string, isOpen fun
 	return pickHealthy(members, excludeSessionID, isOpen, true)
 }
 
-// PickHealthyMember answers the other question a caller can have after a failure: not "who
-// should take over as main" but "is there anywhere left to send this". Same eligibility rules as
-// PickHealthyBackup except that main counts — a caller holding a message that still needs to go
-// out is perfectly happy with the main already sitting there, and only a promotion has reason to
-// exclude it. Rotate's "" is ambiguous on its own (see its doc comment); re-reading the pool and
-// asking this instead is how a caller tells "pool exhausted" from "a load-spread backup went
-// down and main is fine".
+// PickHealthyMember answers the other question a caller can have after a failure: not "who should
+// take over as main" but "is there anywhere left to send this". Same rules as PickHealthyBackup
+// except that main counts — only a promotion has reason to exclude it. It is how a caller
+// disambiguates Rotate's "" between an exhausted pool and a downed load-spread backup.
+//
+// It says nothing about whether the session is logged in; a caller that cares must ask separately.
 func PickHealthyMember(members []PoolMember, excludeSessionID string, isOpen func(sessionID string) bool) (sessionID string, ok bool) {
 	return pickHealthy(members, excludeSessionID, isOpen, false)
 }
 
+// EligibleToServe reports whether m may carry a send right now: it is not the session being
+// rotated away from, it has not been disqualified by a real serving failure, and its circuit is
+// not open. It is exported because callers outside this package need to filter members by the
+// same rule — wa-consumer-api's status-probe walk restated it inline, so a criterion added here
+// silently did not apply there and a send could be routed onto a member the store considers
+// ineligible.
+//
+// isOpen may be nil, which means "no circuit information available"; that is treated as closed
+// rather than as a reason to skip, since refusing every member on a missing health check is the
+// worse way to be wrong.
+//
+// It says nothing about whether the session is logged in. That needs I/O, and this is pure.
+func EligibleToServe(m PoolMember, excludeSessionID string, isOpen func(sessionID string) bool) bool {
+	if m.SessionID == excludeSessionID || m.Disqualified {
+		return false
+	}
+	return isOpen == nil || !isOpen(m.SessionID)
+}
+
 func pickHealthy(members []PoolMember, excludeSessionID string, isOpen func(sessionID string) bool, skipMain bool) (string, bool) {
 	for _, m := range members {
-		if m.SessionID == excludeSessionID || m.Disqualified {
-			continue
-		}
 		if skipMain && m.IsMain {
 			continue
 		}
-		if isOpen != nil && isOpen(m.SessionID) {
-			continue
+		if EligibleToServe(m, excludeSessionID, isOpen) {
+			return m.SessionID, true
 		}
-		return m.SessionID, true
 	}
 	return "", false
 }
@@ -295,15 +366,7 @@ func (s *Store) Rotate(ctx context.Context, sender, failedSessionID string, isOp
 		return "", nil
 	}
 
-	var wasMain bool
-	for _, m := range members {
-		if m.SessionID == failedSessionID {
-			wasMain = m.IsMain
-			break
-		}
-	}
-
-	if wasMain {
+	if IsMain(members, failedSessionID) {
 		if backup, ok := PickHealthyBackup(members, failedSessionID, isOpen); ok {
 			if err := s.Promote(ctx, sender, backup); err != nil {
 				return "", err

@@ -1,5 +1,6 @@
 import { proto, type WAMessage, type WASocket } from 'baileys'
 import type { Logger } from '../logger.js'
+import { mapAckError } from '../wa/error-mapping.js'
 import { EventBus, nowIso, type SessionEvent } from './events.js'
 
 const STATUS_NAMES: Record<number, string> = Object.fromEntries(
@@ -89,7 +90,16 @@ export function subscribeToMessageEvents(
     for (const { key, update } of updates) {
       if (!key.id || update.status === undefined || update.status === null) continue
       if (!key.fromMe) continue
+
       const isError = update.status === proto.WebMessageInfo.Status.ERROR
+      // Baileys puts WhatsApp's own ack error (e.g. "463") in the first stub parameter. It has to
+      // be carried through: a consumer routes a pooled sender away from a session on a rejection,
+      // and flattening every reason into one code makes a bad recipient look like a bad session.
+      const waErrorCode = isError ? (update.messageStubParameters?.[0] ?? undefined) : undefined
+      if (isError) {
+        logger.warn({ sessionId, messageId: key.id, waErrorCode }, 'message rejected by whatsapp')
+      }
+
       events.emit({
         type: 'message.status',
         sessionId,
@@ -97,9 +107,7 @@ export function subscribeToMessageEvents(
         messageId: key.id,
         to: key.remoteJid ?? '',
         status: statusName(update.status),
-        // WhatsApp's own reason (e.g. "463", a missing-privacy-token rejection) never makes
-        // it further than this log; a consumer only needs to know the send did not land.
-        ...(isError ? { errorCode: 'message_rejected' } : {}),
+        ...(isError ? { errorCode: mapAckError(waErrorCode) } : {}),
       })
     }
   })

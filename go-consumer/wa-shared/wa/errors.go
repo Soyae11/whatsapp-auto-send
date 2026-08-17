@@ -21,6 +21,7 @@ var (
 	ErrSendFailed = errors.New("wa: send failed")
 	ErrPairingFailed = errors.New("wa: pairing failed")
 	ErrUpstreamTimeout = errors.New("wa: upstream timeout")
+	ErrMessageRejected = errors.New("wa: message rejected after handoff")
 	ErrInternal = errors.New("wa: internal error")
 	ErrUnexpectedResponse = errors.New("wa: unexpected response")
 )
@@ -41,6 +42,11 @@ const (
 	CodePairingFailed        = "pairing_failed"
 	CodeUpstreamTimeout      = "upstream_timeout"
 	CodeInternalError        = "internal_error"
+
+	// CodeMessageRejected only ever arrives on a rejection receipt, never on a send response:
+	// WhatsApp took the message and then refused it, usually because the sending account is
+	// restricted from opening new chats. That indicts the account, so it faults the session.
+	CodeMessageRejected = "message_rejected"
 )
 
 var sentinelByCode = map[string]error{
@@ -59,6 +65,7 @@ var sentinelByCode = map[string]error{
 	CodePairingFailed:        ErrPairingFailed,
 	CodeUpstreamTimeout:      ErrUpstreamTimeout,
 	CodeInternalError:        ErrInternal,
+	CodeMessageRejected:      ErrMessageRejected,
 }
 
 type APIError struct {
@@ -130,17 +137,13 @@ func ErrorCode(err error) string {
 	return ""
 }
 
-// FaultsSession reports whether a failure indicts the session that carried it, rather than the
-// request it was carrying. The distinction drives three separate decisions — whether to count the
-// failure against a session's circuit breaker, whether to fail a sender's pool over to another
-// session, and whether a rejection receipt should rotate a pool — so it is defined once here
-// instead of once per caller, where the copies would drift and a session could end up disqualified
-// by one rule while another still considered it healthy.
+// FaultsSession reports whether a failure indicts the session that carried it rather than the
+// request it was carrying. It drives the circuit breaker, pool failover, and pool rotation on a
+// rejection receipt, so it lives here once rather than drifting into three copies.
 //
-// Only failures that would repeat identically on any session are the request's fault: a recipient
-// who is not on WhatsApp, a payload WhatsApp will not accept. Everything else, including an
-// unrecognised error, counts against the session — an unexplained failure is the session's problem
-// until something says otherwise, which is the safe direction to be wrong in.
+// Only failures that would repeat identically on any session are the request's fault. Everything
+// else, an unrecognised error included, counts against the session — the safe direction to be
+// wrong in.
 func FaultsSession(err error) bool {
 	if err == nil {
 		return false
@@ -157,8 +160,8 @@ func FaultsSession(err error) bool {
 }
 
 // FaultsSessionCode is FaultsSession for callers holding only a wire error code — a rejection
-// receipt, say, where the original error object is long gone. An unknown or empty code takes the
-// same "assume the session" default FaultsSession gives an unrecognised error.
+// receipt, where the original error object is long gone. Unknown and empty codes take the same
+// "assume the session" default.
 func FaultsSessionCode(code string) bool {
 	if sentinel, known := sentinelByCode[code]; known {
 		return FaultsSession(sentinel)

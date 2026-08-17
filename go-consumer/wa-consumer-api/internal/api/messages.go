@@ -98,7 +98,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 	// Everything is validated before the key is claimed, so a request that never had a
 	// chance of being accepted does not leave a claim behind for its own retry to trip on.
-	plan, ok := s.planSend(w, r, req, callerKey)
+	plan, ok := s.planSend(w, r, req, callerKey, nil)
 	if !ok {
 		return
 	}
@@ -162,10 +162,14 @@ func (s *Server) handleSendBatch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runBatch(w http.ResponseWriter, r *http.Request, items []batchItem) batchResponse {
 	out := batchResponse{Results: make([]batchResult, 0, len(items))}
 
+	// One memo for the whole batch: items naming the same sender share its routing and its
+	// health verdict instead of each re-deriving them. See sendMemo.
+	memo := newSendMemo()
+
 	for i, item := range items {
 		rec := &problemRecorder{header: http.Header{}}
 
-		plan, ok := s.planSend(rec, r, item.sendFields, item.IdempotencyKey)
+		plan, ok := s.planSend(rec, r, item.sendFields, item.IdempotencyKey, memo)
 		if ok && plan.dryRun {
 			out.Accepted++
 			msg := s.dryRunMessage(r.Context(), plan)
@@ -211,6 +215,62 @@ func firstDuplicateKey(items []batchItem) (string, int) {
 	return "", 0
 }
 
+// sendMemo caches the per-sender decisions planSend makes, for the length of one request.
+//
+// A batch may name the same sender a hundred times, and each item asked independently: a pool
+// read, a queue-depth read, a status read, and — when that session is logged out — a probe walk
+// across every pool member and a rotation attempt that deliberately writes nothing when the pool
+// has nowhere to go. None of it varies between two items naming the same sender, so a hundred-item
+// batch paid for the same answer a hundred times: up to 4.5s of I/O per item behind a 60s write
+// timeout, which a caller could only respond to by retrying the whole batch onto a claim that had
+// since expired — and being sent twice.
+//
+// A nil *sendMemo caches nothing and every method still works, which is what a single send wants.
+// A memo must not outlive its request: the answers are only as fresh as the moment it was made.
+type sendMemo struct {
+	routing  map[string]poolRouting
+	verdicts map[string]senderVerdict
+}
+
+func newSendMemo() *sendMemo {
+	return &sendMemo{
+		routing:  map[string]poolRouting{},
+		verdicts: map[string]senderVerdict{},
+	}
+}
+
+// routingFor answers with the pool read for this sender earlier in the same request, or reads it.
+// Errors are cached too: a misconfigured pool is misconfigured for every item of the batch, and
+// re-reading to rediscover that is the same wasted query a hundred times over.
+func (m *sendMemo) routingFor(sender string, read func() poolRouting) poolRouting {
+	if m == nil {
+		return read()
+	}
+	if got, ok := m.routing[sender]; ok {
+		return got
+	}
+	got := read()
+	m.routing[sender] = got
+	return got
+}
+
+// verdictFor is keyed by session id, not by sender: load spreading routes the items of one batch
+// across several members, and "is this session logged out, and where should it go instead" is a
+// question about the session that was chosen. Keying it by sender would answer for a member that
+// was never asked about. A batch that is not spreading names one session throughout and so pays
+// for one status read, which is the case worth collapsing.
+func (m *sendMemo) verdictFor(sessionID string, decide func() senderVerdict) senderVerdict {
+	if m == nil {
+		return decide()
+	}
+	if got, ok := m.verdicts[sessionID]; ok {
+		return got
+	}
+	v := decide()
+	m.verdicts[sessionID] = v
+	return v
+}
+
 // sendPlan is a request that has passed every check and is ready to be queued, or to be
 // answered as a dry run.
 type sendPlan struct {
@@ -224,7 +284,7 @@ type sendPlan struct {
 	dryRun    bool
 }
 
-func (s *Server) planSend(w http.ResponseWriter, r *http.Request, req sendFields, callerKey string) (sendPlan, bool) {
+func (s *Server) planSend(w http.ResponseWriter, r *http.Request, req sendFields, callerKey string, memo *sendMemo) (sendPlan, bool) {
 	if req.Type != tasks.MessageTypeText {
 		writeFieldProblem(w, r, CodeInvalidRequest,
 			`'type' is required and the only value it takes is "text". It is required rather than defaulted so that adding media types later cannot change what an existing request means.`,
@@ -243,7 +303,7 @@ func (s *Server) planSend(w http.ResponseWriter, r *http.Request, req sendFields
 		return sendPlan{}, false
 	}
 
-	sender, err := s.resolveSendSession(r.Context(), sender)
+	sender, members, err := s.resolveSendSession(r.Context(), sender, memo)
 	if err != nil {
 		if errors.Is(err, errSenderPoolExhausted) {
 			writeProblem(w, r, CodeSenderPoolExhausted, "Sender "+quoteOrEmpty(sender.Name)+
@@ -286,7 +346,7 @@ func (s *Server) planSend(w http.ResponseWriter, r *http.Request, req sendFields
 		return sendPlan{}, false
 	}
 
-	if !dryRun && !s.senderCanSend(w, r, &sender) {
+	if !dryRun && !s.senderCanSend(w, r, &sender, members, memo) {
 		return sendPlan{}, false
 	}
 
@@ -399,7 +459,7 @@ func (s *Server) underIdempotency(w http.ResponseWriter, r *http.Request, caller
 	defer cancel()
 
 	hash := store.HashRequest(body)
-	replay, err := s.idempotency.ClaimIdempotencyKey(claimCtx, key.ID, callerKey, hash)
+	claimID, replay, err := s.idempotency.ClaimIdempotencyKey(claimCtx, key.ID, callerKey, hash)
 	switch {
 	case errors.Is(err, store.ErrIdempotencyConflict):
 		s.log.Warn("idempotency key reused with a different payload",
@@ -432,7 +492,7 @@ func (s *Server) underIdempotency(w http.ResponseWriter, r *http.Request, caller
 	if !ok {
 		// Nothing replayable happened, so the claim must go — otherwise the caller's own
 		// retry would collide with a key that recorded no outcome.
-		s.releaseClaim(r, key.ID, callerKey)
+		s.releaseClaim(r, key.ID, callerKey, claimID)
 		return
 	}
 
@@ -440,25 +500,33 @@ func (s *Server) underIdempotency(w http.ResponseWriter, r *http.Request, caller
 	if err != nil {
 		s.log.Error("could not encode the response for replay",
 			"request_id", requestIDFrom(r.Context()), "error", err)
-		s.releaseClaim(r, key.ID, callerKey)
+		s.releaseClaim(r, key.ID, callerKey, claimID)
 		writeProblem(w, r, CodeInternalError, "The message was accepted but the response could not be encoded. Report request id "+requestIDFrom(r.Context())+".")
 		return
 	}
 
-	// A context of its own, on two counts. It must not inherit claimCtx's budget, which was spent
-	// on the claim and on work() and is long gone by now — a batch send would record nothing and
-	// leave the claim stranded with no response, which is the one state that answers every later
-	// retry with "still being processed". And it must outlive the request, because a caller that
-	// hung up still needs its key to end up replayable rather than stuck.
+	// A context of its own, on two counts: claimCtx's budget was spent on the claim and work(),
+	// and a caller that hung up still needs its key to end up replayable. Recording nothing
+	// strands the claim with no response — the one state that answers every retry with "still
+	// being processed".
 	recCtx, recCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
 	defer recCancel()
 
-	if err := s.idempotency.RecordIdempotentResponse(recCtx, key.ID, callerKey, status, encoded); err != nil {
-		// The work is done and the message is queued. Failing the response here would
-		// invite a retry that sends nothing new but reports failure, so answer normally.
-		// The claim is left behind deliberately: it stops a retry re-sending while this
-		// request is still in the air, and store.IdempotencyInFlightTimeout caps how long
-		// an unrecorded one can block the key.
+	switch err := s.idempotency.RecordIdempotentResponse(recCtx, key.ID, callerKey, claimID, status, encoded); {
+	case errors.Is(err, store.ErrIdempotencyClaimTaken):
+		// This request outran the in-flight timeout and a retry took the key over, so the response
+		// stored under it is that retry's and must stay. Answer this caller normally: the work
+		// really did happen. Worth an alert, though — it means a send took over five minutes, and
+		// the takeover sent the message a second time.
+		s.log.Warn("finished after the idempotency claim was taken over; the response was not recorded",
+			"alert", true,
+			"request_id", requestIDFrom(r.Context()), "api_key_id", key.ID, "idempotency_key", callerKey)
+
+	case err != nil:
+		// The work is done and the message is queued, so answer normally rather than inviting a
+		// retry that sends nothing new. The claim is left behind deliberately — it stops a retry
+		// re-sending while this request is in the air, and store.IdempotencyInFlightTimeout caps
+		// how long an unrecorded one can block the key.
 		s.log.Error("could not record the idempotent response",
 			"request_id", requestIDFrom(r.Context()), "api_key_id", key.ID, "idempotency_key", callerKey, "error", err)
 	}
@@ -474,11 +542,11 @@ func (s *Server) runAndWrite(w http.ResponseWriter, work func() (int, any, bool)
 	}
 }
 
-func (s *Server) releaseClaim(r *http.Request, apiKeyID, callerKey string) {
+func (s *Server) releaseClaim(r *http.Request, apiKeyID, callerKey, claimID string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
 	defer cancel()
 
-	if err := s.idempotency.ReleaseIdempotencyKey(ctx, apiKeyID, callerKey); err != nil {
+	if err := s.idempotency.ReleaseIdempotencyKey(ctx, apiKeyID, callerKey, claimID); err != nil {
 		s.log.Error("could not release the idempotency claim",
 			"request_id", requestIDFrom(r.Context()), "api_key_id", apiKeyID, "idempotency_key", callerKey, "error", err)
 	}
@@ -516,18 +584,41 @@ func (s *Server) dryRunRequested(w http.ResponseWriter, r *http.Request, sender 
 }
 
 // senderCanSend refuses only the case where queueing cannot help: a logged-out sender needs a
-// human to re-pair it. A reconnecting or briefly disconnected sender still returns 202,
-// because the message waits in the queue and goes out on recovery.
+// human to re-pair it. A reconnecting or briefly disconnected sender still gets 202, because the
+// message waits in the queue and goes out on recovery.
 //
-// A logged-out session is itself a failure signal — for a pooled sender it is treated exactly
-// like a failed send would be (see rotatePoolAfterFailure and the dispatcher's synchronous
-// path): this discovers the failure proactively, before ever queueing, rather than reactively
-// after a doomed send attempt. When the pool still has a usable session — one promoted into
-// main's place, or the main that was never in trouble because load spreading had merely routed
-// this send to a backup — sender.SessionID is updated in place so the caller's plan uses it.
-func (s *Server) senderCanSend(w http.ResponseWriter, r *http.Request, sender *senders.Sender) bool {
+// A logged-out session is itself a failure signal, so a pooled sender rotates on it exactly as it
+// would on a failed send — finding the failure before queueing rather than after a doomed
+// attempt. When the pool still has a usable session, sender.SessionID is updated in place.
+//
+// members is the pool resolveSendSession already read for this sender, threaded down rather than
+// read again; it is nil for a single-mode sender, which never reaches the rotation branch.
+//
+// The decision and the response are separate on purpose: the decision costs a status read and
+// possibly a whole probe walk, so a batch caches it per sender, while the refusal has to be
+// written once per item that it rejects.
+func (s *Server) senderCanSend(w http.ResponseWriter, r *http.Request, sender *senders.Sender, members []store.PoolMember, memo *sendMemo) bool {
+	v := memo.verdictFor(sender.SessionID, func() senderVerdict {
+		return s.senderVerdict(r, *sender, members)
+	})
+	if !v.ok {
+		s.refuseLoggedOutSender(w, r, sender)
+		return false
+	}
+	sender.SessionID = v.sessionID
+	return true
+}
+
+// senderVerdict is senderCanSend's decision on its own: may this sender send, and through which
+// session. Cacheable for the length of a request precisely because it writes nothing.
+type senderVerdict struct {
+	sessionID string
+	ok        bool
+}
+
+func (s *Server) senderVerdict(r *http.Request, sender senders.Sender, members []store.PoolMember) senderVerdict {
 	if s.sessions == nil {
-		return true
+		return senderVerdict{sessionID: sender.SessionID, ok: true}
 	}
 
 	ctx, cancel := contextWithTimeout(r, 3*time.Second)
@@ -537,20 +628,19 @@ func (s *Server) senderCanSend(w http.ResponseWriter, r *http.Request, sender *s
 	if err != nil {
 		s.log.Warn("could not read sender status, accepting the send",
 			"request_id", requestIDFrom(r.Context()), "sender", sender.Name, "error", err)
-		return true
+		return senderVerdict{sessionID: sender.SessionID, ok: true}
 	}
 	if view != wa.StatusLoggedOut {
-		return true
+		return senderVerdict{sessionID: sender.SessionID, ok: true}
 	}
 
-	if s.pools != nil && sender.Mode == senders.ModePool {
-		if next, ok := s.rotateToHealthyMember(ctx, sender.Name, sender.SessionID); ok {
+	if s.pools != nil && sender.Mode == senders.ModePool && len(members) > 0 {
+		if next, ok := s.rotateToConnectedMember(ctx, sender.Name, sender.SessionID, members); ok {
 			s.log.Warn("sender logged out at send time, pool rotated",
 				"alert", true,
 				"request_id", requestIDFrom(r.Context()),
 				"sender", sender.Name, "session_id", sender.SessionID, "rotated_to", next)
-			sender.SessionID = next
-			return true
+			return senderVerdict{sessionID: next, ok: true}
 		}
 	}
 
@@ -559,10 +649,13 @@ func (s *Server) senderCanSend(w http.ResponseWriter, r *http.Request, sender *s
 		"request_id", requestIDFrom(r.Context()),
 		"sender", sender.Name,
 		"session_id", sender.SessionID)
+	return senderVerdict{sessionID: sender.SessionID, ok: false}
+}
+
+func (s *Server) refuseLoggedOutSender(w http.ResponseWriter, r *http.Request, sender *senders.Sender) {
 	w.Header().Set("Retry-After", "300")
 	writeProblem(w, r, CodeSenderUnavailable, "Sender "+quoteOrEmpty(sender.Name)+
 		" is logged out and a human has to re-pair it, so queueing this message would not help — it was refused rather than left to expire in a queue. The platform team is being alerted. Retry with the same idempotency key once the sender is back.")
-	return false
 }
 
 func validateMetadata(m map[string]string) error {

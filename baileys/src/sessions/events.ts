@@ -29,9 +29,9 @@ export type SessionEvent =
       to: string
       status: string
       /**
-       * Only set when status is 'error': WhatsApp rejected the message after it was already
-       * handed off, so the HTTP response to /send had already reported success. This is the
-       * only channel a consumer has for finding out that a "sent" message never landed.
+       * Only set when status is 'error', in the same vocabulary /send errors use. It is the only
+       * channel a consumer has for learning that a "sent" message never landed, and the code is
+       * what separates a rejection the session caused from one the recipient caused.
        */
       errorCode?: string
     }

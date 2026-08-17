@@ -27,6 +27,9 @@ type Circuit interface {
 	Open(ctx context.Context, sessionID, reason, errorCode string) (bool, error)
 	Close(ctx context.Context, sessionID string) (bool, error)
 	State(ctx context.Context, sessionID string) (circuit.State, error)
+	// States is State for a whole pool in one round trip. Sessions with nothing stored come
+	// back as closed circuits, so a caller may index the map for any id it asked about.
+	States(ctx context.Context, sessionIDs []string) (map[string]circuit.State, error)
 }
 
 type JobStore interface {
@@ -63,9 +66,9 @@ type MessageStore interface {
 }
 
 type IdempotencyStore interface {
-	ClaimIdempotencyKey(ctx context.Context, apiKeyID, key, requestHash string) (*store.IdempotentResponse, error)
-	RecordIdempotentResponse(ctx context.Context, apiKeyID, key string, statusCode int, body []byte) error
-	ReleaseIdempotencyKey(ctx context.Context, apiKeyID, key string) error
+	ClaimIdempotencyKey(ctx context.Context, apiKeyID, key, requestHash string) (claimID string, replay *store.IdempotentResponse, err error)
+	RecordIdempotentResponse(ctx context.Context, apiKeyID, key, claimID string, statusCode int, body []byte) error
+	ReleaseIdempotencyKey(ctx context.Context, apiKeyID, key, claimID string) error
 }
 
 // Pools is a sender's main/backup session pool — see wa_sender_pools. A sender with no pool
@@ -76,6 +79,7 @@ type Pools interface {
 	CreatePool(ctx context.Context, sender string, sessionIDs []string) error
 	DeletePool(ctx context.Context, sender string) error
 	Promote(ctx context.Context, sender, newMainSessionID string) error
+	Handover(ctx context.Context, sender, newMainSessionID string) error
 	Disqualify(ctx context.Context, sender, sessionID string) error
 	Reinstate(ctx context.Context, sender, sessionID string) error
 	AddMember(ctx context.Context, sender, sessionID string) error

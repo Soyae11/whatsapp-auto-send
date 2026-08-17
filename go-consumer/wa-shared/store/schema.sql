@@ -97,6 +97,14 @@ BEGIN
   END IF;
 END $$;
 
+-- claim_id names the request that currently holds the row. A claim is takeable once it is older
+-- than the in-flight timeout with no response recorded, so without a fencing token the request
+-- that was taken over could still come back and record its response over the taker's, or delete
+-- the taker's in-flight claim on its way out and let a third request send a third copy. Every
+-- write past the claim itself carries the token it was handed and matches on it, so a request
+-- that lost the row writes nothing at all.
+ALTER TABLE wa_idempotency ADD COLUMN IF NOT EXISTS claim_id TEXT;
+
 CREATE INDEX IF NOT EXISTS wa_idempotency_created_at_idx ON wa_idempotency (created_at);
 
 -- secret is stored in the clear because outbound deliveries have to HMAC with it. Unlike an

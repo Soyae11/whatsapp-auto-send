@@ -166,13 +166,11 @@ func (b *Breaker) Success(ctx context.Context, sessionID string) error {
 
 // Open opens a session's circuit and reports whether this call is what changed the state.
 //
-// A circuit that is already open is normally left exactly as it is. The exception is a manual
-// pause, which takes over a circuit the breaker had tripped by itself: the two look identical
-// from the queues' side, but only one survives the watcher. Watcher.evaluate closes any circuit
-// whose reason is not ReasonManual once the session polls healthy again, so a pause that failed to
-// overwrite an automatic reason would be undone a few polls later — the session resumes sending
-// while an operator has every reason to believe they stopped it. The takeover is one-way: nothing
-// automatic overwrites a manual pause, which continues to need an explicit Close.
+// An already-open circuit is left as it is, except that a manual pause takes over one the breaker
+// tripped itself. Watcher.evaluate closes any circuit whose reason is not ReasonManual once the
+// session polls healthy again, so a pause that did not overwrite the automatic reason would be
+// undone a few polls later — the session resumes while an operator believes they stopped it. The
+// takeover is one-way: nothing automatic overwrites a manual pause.
 func (b *Breaker) Open(ctx context.Context, sessionID, reason, errorCode string) (opened bool, err error) {
 	if sessionID == "" {
 		return false, errors.New("circuit: empty session id")
@@ -249,6 +247,56 @@ func (b *Breaker) State(ctx context.Context, sessionID string) (State, error) {
 	if err != nil {
 		return State{}, fmt.Errorf("circuit: state for %s: %w", sessionID, err)
 	}
+	return decodeState(sessionID, vals)
+}
+
+// States is State for a whole set of sessions at once. Every caller that asks about a sender's
+// pool asks about all of its members, and doing that one session at a time is one Redis round
+// trip per member on a path that already has a budget to keep — the pool-routing walk in
+// wa-consumer-api asked N times per request, twice over, before this existed. MGet already reads
+// several keys in one command, so all 2N keys cost exactly what two did.
+//
+// Sessions are returned in a map keyed by session id; an id with nothing stored comes back as a
+// closed circuit with no failures, which is what State reports for it too. An empty id is
+// skipped rather than failing the batch: one bad member must not blind a caller to the rest.
+func (b *Breaker) States(ctx context.Context, sessionIDs []string) (map[string]State, error) {
+	out := make(map[string]State, len(sessionIDs))
+
+	keys := make([]string, 0, len(sessionIDs)*2)
+	ids := make([]string, 0, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		if sessionID == "" || out[sessionID].SessionID == sessionID {
+			continue
+		}
+		out[sessionID] = State{SessionID: sessionID}
+		ids = append(ids, sessionID)
+		keys = append(keys, StateKey(sessionID), FailuresKey(sessionID))
+	}
+	if len(keys) == 0 {
+		return out, nil
+	}
+
+	vals, err := b.rdb.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, fmt.Errorf("circuit: states for %d sessions: %w", len(ids), err)
+	}
+	if len(vals) != len(keys) {
+		return nil, fmt.Errorf("circuit: states returned %d values, want %d", len(vals), len(keys))
+	}
+
+	for i, sessionID := range ids {
+		state, err := decodeState(sessionID, vals[i*2:i*2+2])
+		if err != nil {
+			return nil, err
+		}
+		out[sessionID] = state
+	}
+	return out, nil
+}
+
+// decodeState reads the [state, failures] pair MGet returns for one session. Absent keys arrive
+// as nil, which is a closed circuit that has not failed.
+func decodeState(sessionID string, vals []any) (State, error) {
 	if len(vals) != 2 {
 		return State{}, fmt.Errorf("circuit: state for %s returned %d values, want 2", sessionID, len(vals))
 	}

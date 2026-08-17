@@ -38,6 +38,11 @@ var Statuses = []Status{
 	StatusScheduled, StatusSending, StatusSent, StatusRetrying, StatusFailed, StatusCancelled,
 }
 
+// EnqueueFailedCode marks a row the dispatcher recorded but never got onto the queue. It lives
+// here rather than in dispatch because MarkScheduled reads it to tell those rows apart from
+// messages that genuinely sent and then failed.
+const EnqueueFailedCode = "dispatcher_enqueue_failed"
+
 func ParseStatus(s string) (Status, error) {
 	for _, known := range Statuses {
 		if string(known) == s {
@@ -158,47 +163,76 @@ func (s *Store) Migrate(ctx context.Context) error {
 // left alone — it is either in flight or finished, and this call is a duplicate enqueue that
 // asynq will reject on task id a moment later.
 //
-// The exception is a row sitting at 'failed'. Enqueue writes that row itself, through
-// markUnqueued, when the job was recorded but never reached asynq; the caller is then free to
-// retry, and does so carrying a public id minted fresh for the new attempt. Leaving the old row
-// untouched there stranded the caller: the API answered with the new id while the row kept the
-// old one, so the message really did send but could never be looked up, and its webhooks named an
-// id the caller had never seen. Taking the row over re-points it at the attempt now under way,
-// and clears the previous attempt's failure so a row reading 'scheduled' does not still carry the
-// error and failed_at that contradict it. attempts is left as it is — wa_job_attempts is the
-// history, and this is not a new message, only a new try at the same one.
-func (s *Store) MarkScheduled(ctx context.Context, j Job, scheduledFor time.Time) error {
+// The exception is a row that never reached asynq at all: Enqueue writes those itself through
+// markUnqueued, and the caller is free to retry with a public id minted fresh for the new
+// attempt. Leaving the old row untouched stranded that caller — the API answered with the new id
+// while the row kept the old one, so the message sent but could never be looked up.
+//
+// The predicate has to name that case exactly, not merely 'failed': a message that really did
+// send and then failed can be reached by the same idempotency key once IdempotencyRetention has
+// passed, and re-pointing its public_id would strand a caller the same way, only in the other
+// direction. So it also requires markUnqueued's own error code and a row that never sent.
+// attempts is left alone — wa_job_attempts is the history, and this is a new try, not a new
+// message.
+//
+// It returns the public id the row actually carries once the dust settles, which is the id the
+// caller must answer with. When this job's row was inserted or taken over that is the id it just
+// minted; when an existing row was left standing it is the id an earlier caller was given, and it
+// is the row the status endpoint and the webhooks will keep naming — answering with the fresh one
+// would hand back something that addresses nothing.
+//
+// Both come from the one statement. The UNION ALL reads the surviving row only when the upsert
+// declined to touch it, exactly as ClaimIdempotencyKey does; asking a second query for it would
+// be a round trip to re-derive a value this statement already had in hand.
+func (s *Store) MarkScheduled(ctx context.Context, j Job, scheduledFor time.Time) (publicID string, err error) {
 	metadata, err := marshalMetadata(j.Metadata)
 	if err != nil {
-		return fmt.Errorf("store: mark scheduled %s: %w", j.IdempotencyKey, err)
+		return "", fmt.Errorf("store: mark scheduled %s: %w", j.IdempotencyKey, err)
 	}
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO wa_jobs (idempotency_key, session_id, to_number, source_ref, status, scheduled_for,
-		                     public_id, api_key_id, sender, priority, metadata, failover_of)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-		ON CONFLICT (idempotency_key) DO UPDATE
-		   SET status         = EXCLUDED.status,
-		       scheduled_for  = EXCLUDED.scheduled_for,
-		       session_id     = EXCLUDED.session_id,
-		       to_number      = EXCLUDED.to_number,
-		       source_ref     = COALESCE(EXCLUDED.source_ref, wa_jobs.source_ref),
-		       public_id      = COALESCE(EXCLUDED.public_id, wa_jobs.public_id),
-		       api_key_id     = COALESCE(EXCLUDED.api_key_id, wa_jobs.api_key_id),
-		       sender         = COALESCE(EXCLUDED.sender, wa_jobs.sender),
-		       priority       = COALESCE(EXCLUDED.priority, wa_jobs.priority),
-		       metadata       = COALESCE(EXCLUDED.metadata, wa_jobs.metadata),
-		       failover_of    = COALESCE(EXCLUDED.failover_of, wa_jobs.failover_of),
-		       last_error_code = NULL,
-		       last_error_at   = NULL,
-		       failed_at       = NULL
-		 WHERE wa_jobs.status = $13`,
+
+	var stored *string
+	err = s.pool.QueryRow(ctx, `
+		WITH scheduled AS (
+			INSERT INTO wa_jobs (idempotency_key, session_id, to_number, source_ref, status, scheduled_for,
+			                     public_id, api_key_id, sender, priority, metadata, failover_of)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			ON CONFLICT (idempotency_key) DO UPDATE
+			   SET status         = EXCLUDED.status,
+			       scheduled_for  = EXCLUDED.scheduled_for,
+			       session_id     = EXCLUDED.session_id,
+			       to_number      = EXCLUDED.to_number,
+			       source_ref     = COALESCE(EXCLUDED.source_ref, wa_jobs.source_ref),
+			       public_id      = COALESCE(EXCLUDED.public_id, wa_jobs.public_id),
+			       api_key_id     = COALESCE(EXCLUDED.api_key_id, wa_jobs.api_key_id),
+			       sender         = COALESCE(EXCLUDED.sender, wa_jobs.sender),
+			       priority       = COALESCE(EXCLUDED.priority, wa_jobs.priority),
+			       metadata       = COALESCE(EXCLUDED.metadata, wa_jobs.metadata),
+			       failover_of    = COALESCE(EXCLUDED.failover_of, wa_jobs.failover_of),
+			       last_error_code = NULL,
+			       last_error_at   = NULL,
+			       failed_at       = NULL
+			 WHERE wa_jobs.status = $13
+			   AND wa_jobs.last_error_code = $14
+			   AND wa_jobs.sent_at IS NULL
+			RETURNING public_id
+		)
+		SELECT public_id FROM scheduled
+		UNION ALL
+		SELECT public_id
+		  FROM wa_jobs
+		 WHERE idempotency_key = $1
+		   AND NOT EXISTS (SELECT 1 FROM scheduled)
+		 LIMIT 1`,
 		j.IdempotencyKey, j.SessionID, j.To, nullable(j.SourceRef), StatusScheduled, scheduledFor,
 		nullable(j.PublicID), nullable(j.APIKeyID), nullable(j.Sender), nullable(j.Priority), metadata,
-		nullable(j.FailoverOf), StatusFailed)
+		nullable(j.FailoverOf), StatusFailed, EnqueueFailedCode).Scan(&stored)
 	if err != nil {
-		return fmt.Errorf("store: mark scheduled %s: %w", j.IdempotencyKey, err)
+		return "", fmt.Errorf("store: mark scheduled %s: %w", j.IdempotencyKey, err)
 	}
-	return nil
+	if stored == nil {
+		return "", nil
+	}
+	return *stored, nil
 }
 
 func (s *Store) BeginAttempt(ctx context.Context, j Job) (attempts int, err error) {

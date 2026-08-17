@@ -22,6 +22,27 @@ export function isWhatsAppError(err: unknown): boolean {
   return statusCodeOf(err) !== undefined
 }
 
+/**
+ * Codes WhatsApp puts on a rejected message's ack. Only the two we can act on differently are
+ * named; everything else takes the 'send_failed' default, which consumers read as the session's
+ * fault. 463 is a restriction on the sending account, so another number can carry the message.
+ * 404 is about the recipient JID and would fail identically on any session.
+ *
+ * A Map rather than an object literal: waErrorCode comes straight off the wire, and an object
+ * lookup resolves inherited keys — 'constructor', 'toString' — to a function, which `??` has no
+ * reason to replace. The event would then carry a function as its errorCode, JSON.stringify would
+ * drop the key, and the consumer would see no reason at all.
+ */
+const ACK_ERROR_CODES = new Map<string, string>([
+  ['404', 'not_on_whatsapp'],
+  ['463', 'message_rejected'],
+])
+
+export function mapAckError(waErrorCode: string | undefined): string {
+  if (waErrorCode === undefined) return 'send_failed'
+  return ACK_ERROR_CODES.get(waErrorCode) ?? 'send_failed'
+}
+
 export function mapSendError(err: unknown, sessionId: string): ApiError {
   return mapWhatsAppError(err, sessionId, sendFailed)
 }

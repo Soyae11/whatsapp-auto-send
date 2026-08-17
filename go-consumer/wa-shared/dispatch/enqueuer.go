@@ -73,7 +73,7 @@ var ErrValidation = errors.New("validation failed")
 func (e *ValidationError) Is(target error) bool { return target == ErrValidation }
 
 type Recorder interface {
-	MarkScheduled(ctx context.Context, j store.Job, scheduledFor time.Time) error
+	MarkScheduled(ctx context.Context, j store.Job, scheduledFor time.Time) (publicID string, err error)
 	MarkFailed(ctx context.Context, j store.Job, errorCode string, permanent bool, at time.Time) error
 	MarkCoalesced(ctx context.Context, idempotencyKey, sourceRef string) (publicID string, err error)
 	MarkRequeued(ctx context.Context, j store.Job, scheduledFor time.Time) error
@@ -83,7 +83,9 @@ type Recorder interface {
 
 type NopRecorder struct{}
 
-func (NopRecorder) MarkScheduled(context.Context, store.Job, time.Time) error { return nil }
+func (NopRecorder) MarkScheduled(context.Context, store.Job, time.Time) (string, error) {
+	return "", nil
+}
 func (NopRecorder) MarkFailed(context.Context, store.Job, string, bool, time.Time) error {
 	return nil
 }
@@ -91,8 +93,6 @@ func (NopRecorder) MarkCoalesced(context.Context, string, string) (string, error
 func (NopRecorder) MarkRequeued(context.Context, store.Job, time.Time) error      { return nil }
 func (NopRecorder) MarkCancelled(context.Context, string) error                   { return nil }
 func (NopRecorder) PublicIDFor(context.Context, string) (string, error)           { return "", nil }
-
-const enqueueFailedCode = "dispatcher_enqueue_failed"
 
 type Enqueuer struct {
 	client    *asynq.Client
@@ -207,9 +207,18 @@ func (e *Enqueuer) Enqueue(ctx context.Context, req SendRequest) (*Result, error
 		FailoverOf:     req.FailoverOf,
 	}
 
-	if err := e.jobs.MarkScheduled(ctx, job, processAt); err != nil {
+	// storedID is the public id the row ends up carrying, which is not always the one minted for
+	// this request: a row left standing by MarkScheduled keeps the id an earlier caller was given,
+	// and that is the row this send moves through. It is "" when the record failed, in which case
+	// the minted id is the only one there is.
+	storedID, err := e.jobs.MarkScheduled(ctx, job, processAt)
+	if err != nil {
 		e.log.Error("could not record scheduled job",
 			"session_id", req.SessionID, "idempotency_key", key, "error", err)
+	}
+	publicID := req.PublicID
+	if storedID != "" {
+		publicID = storedID
 	}
 
 	payload, err := tasks.Marshal(tasks.SendMessagePayload{
@@ -241,7 +250,7 @@ func (e *Enqueuer) Enqueue(ctx context.Context, req SendRequest) (*Result, error
 			"session_id", req.SessionID, "idempotency_key", key, "queue", queue)
 		return &Result{
 			IdempotencyKey: key,
-			PublicID:       e.publicIDFor(ctx, key, req.PublicID),
+			PublicID:       publicID,
 			SessionID:      req.SessionID,
 			To:             to,
 			Queue:          queue,
@@ -265,7 +274,7 @@ func (e *Enqueuer) Enqueue(ctx context.Context, req SendRequest) (*Result, error
 
 	return &Result{
 		IdempotencyKey: key,
-		PublicID:       req.PublicID,
+		PublicID:       publicID,
 		SessionID:      req.SessionID,
 		To:             to,
 		Queue:          queue,
@@ -425,7 +434,7 @@ func (e *Enqueuer) markUnqueued(ctx context.Context, job store.Job, cause error)
 	recCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 
-	if err := e.jobs.MarkFailed(recCtx, job, enqueueFailedCode, true, time.Now().UTC()); err != nil {
+	if err := e.jobs.MarkFailed(recCtx, job, store.EnqueueFailedCode, true, time.Now().UTC()); err != nil {
 		e.log.Error("could not record failed enqueue",
 			"idempotency_key", job.IdempotencyKey, "cause", cause, "error", err)
 	}

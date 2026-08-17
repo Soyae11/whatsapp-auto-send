@@ -299,14 +299,11 @@ func (h *Handler) failoverPooled(
 		return false
 	}
 
-	// A failure that says nothing about the session must not cost the pool a member. A recipient
-	// who is not on WhatsApp, or a payload WhatsApp refuses, fails identically on every session,
-	// so resending it through a backup only buys a second failure — and each hop disqualifies
-	// another member until one mistyped phone number leaves the pool exhausted. TripsCircuit is
-	// already exactly this distinction ("a sick session from a bad request", see Verdict), so
-	// failover reuses it rather than keeping a second list of codes that could drift from it.
-	// Returning false hands these back to the ordinary path, which records them as the permanent,
-	// session-blameless failures they are.
+	// A failure that says nothing about the session must not cost the pool a member: it fails
+	// identically on every session, so each hop only buys another failure and disqualifies
+	// another member until one mistyped number leaves the pool exhausted. TripsCircuit is
+	// already this distinction, so failover reuses it rather than keeping a second list of codes
+	// to drift from it.
 	if !v.TripsCircuit {
 		return false
 	}
@@ -337,13 +334,10 @@ func (h *Handler) failoverPooled(
 		return true
 	}
 
-	// Rotate's "" covers two situations that could not be further apart, and only one is fatal.
-	// If the failed session was main, "" means nothing was eligible to take over and the pool
-	// really is out of options. If it was a load-spread backup, Rotate disqualified it alone and
-	// deliberately left main standing — there is somewhere to send, Rotate simply has no
-	// promotion to report and says so in its doc comment ("a caller that still wants to try a
-	// fresh send picks among the pool's remaining eligible members itself"). Without this, a
-	// message routed to a backup by load spreading was dropped with a healthy main right there.
+	// Rotate's "" covers two situations and only one is fatal: the failed session was main and
+	// nothing was eligible to take over, or it was a load-spread backup that Rotate disqualified
+	// alone, leaving main standing. Re-reading tells them apart — without it, a message routed to
+	// a backup was dropped with a healthy main right there.
 	if backup == "" {
 		remaining, err := h.pools.Pool(ctx, p.Sender)
 		if err != nil {

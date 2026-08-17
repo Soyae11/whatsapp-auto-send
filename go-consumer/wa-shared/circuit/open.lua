@@ -1,10 +1,6 @@
--- Opening a circuit that is already open is not always a no-op: a human pausing a session
--- outranks a breaker that tripped on its own. SETNX alone could not express that — it kept the
--- automatic state, so the watcher went on treating the session as machine-opened and closed it
--- again after a healthy streak, resuming a session somebody had deliberately held down.
---
--- Read-then-write has to be one step, or two callers racing could each decide to overwrite and
--- the loser's state would win. A script is that step.
+-- Opening an already-open circuit is not always a no-op: a human pausing a session outranks a
+-- breaker that tripped on its own, and SETNX cannot express that. Read-then-write has to be one
+-- step, or two racing callers each decide to overwrite and the loser's state wins.
 --
 -- KEYS[1] = circuit state, present only while open
 -- ARGV[1] = state json to store
@@ -25,8 +21,8 @@ if ARGV[2] ~= ARGV[3] then
   return 0
 end
 
--- ...and it has nothing to take over from another pause for the same reason, which would only
--- restamp opened_at and report a change that did not happen.
+-- A pause has nothing to take over from another pause: rewriting would only restamp opened_at
+-- and report a change that did not happen.
 local ok, decoded = pcall(cjson.decode, current)
 if ok and type(decoded) == 'table' and decoded.reason == ARGV[3] then
   return 0

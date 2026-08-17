@@ -155,7 +155,7 @@ describe('subscribeToMessageEvents status updates', () => {
     expect(seen.mock.calls[0]?.[0]).not.toHaveProperty('errorCode')
   })
 
-  it('flags an ERROR status with a stable error code, so a "sent" message that WhatsApp actually rejected does not go unreported', () => {
+  it('flags an ERROR status with no ack reason as the session\'s fault, so a "sent" message that WhatsApp actually rejected does not go unreported', () => {
     const { socket, trigger } = fakeSocket()
     const bus = new EventBus(logger)
     const seen = vi.fn()
@@ -165,7 +165,33 @@ describe('subscribeToMessageEvents status updates', () => {
     trigger('messages.update', [{ key, update: { status: proto.WebMessageInfo.Status.ERROR } }])
 
     expect(seen).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'message.status', status: 'error', errorCode: 'message_rejected' }),
+      expect.objectContaining({ type: 'message.status', status: 'error', errorCode: 'send_failed' }),
+    )
+  })
+
+  // A consumer routes a pooled sender away from a session on a rejection it reads as the
+  // session's fault. Flattening every reason into one code made a bad recipient look like a bad
+  // session, and a handful of them would retire every member of a pool.
+  it.each([
+    ['463', 'message_rejected'],
+    ['404', 'not_on_whatsapp'],
+    ['999', 'send_failed'],
+  ])('carries WhatsApp ack error %s through as %s', (waCode, expected) => {
+    const { socket, trigger } = fakeSocket()
+    const bus = new EventBus(logger)
+    const seen = vi.fn()
+    bus.subscribe(seen)
+    subscribeToMessageEvents(socket, 's1', bus, logger)
+
+    trigger('messages.update', [
+      {
+        key,
+        update: { status: proto.WebMessageInfo.Status.ERROR, messageStubParameters: [waCode] },
+      },
+    ])
+
+    expect(seen).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'message.status', status: 'error', errorCode: expected }),
     )
   })
 

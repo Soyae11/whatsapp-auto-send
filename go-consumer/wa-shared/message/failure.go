@@ -2,9 +2,9 @@ package message
 
 import "wa-shared/wa"
 
-// The four codes a consumer can ever see in last_error or a message.failed webhook. They are
-// deliberately fewer than wa-gateway's: a consumer cannot act on the difference between an
-// upstream timeout and an internal error, only on whether resending will help.
+// The codes a consumer can ever see in last_error or a message.failed webhook. Deliberately
+// fewer than wa-gateway's: a consumer cannot act on the difference between an upstream timeout
+// and an internal error, only on whether resending will help.
 const (
 	FailureNotOnWhatsApp   = "not_on_whatsapp"
 	FailureSenderLoggedOut = "sender_logged_out"
@@ -13,13 +13,8 @@ const (
 	FailureMessageRejected = "message_rejected"
 )
 
-// messageRejectedCode is what wa-gateway's webhook sends when WhatsApp accepts a message and
-// then rejects it — after the job was already marked `sent`. Unlike the codes below this one
-// never goes through the wa dispatch client, so it is not in the `wa` package.
-const messageRejectedCode = "message_rejected"
-
 // FailureCode maps a stored wa-gateway error code to the public vocabulary. Anything
-// unrecognised becomes send_failed, which is the honest summary of "we tried and stopped".
+// unrecognised becomes send_failed, the honest summary of "we tried and stopped".
 func FailureCode(stored string) string {
 	switch stored {
 	case wa.CodeNotOnWhatsApp:
@@ -28,16 +23,14 @@ func FailureCode(stored string) string {
 		return FailureSenderLoggedOut
 	case wa.CodeRateLimitedByWA:
 		return FailureRateLimited
-	case messageRejectedCode:
+	case wa.CodeMessageRejected:
 		return FailureMessageRejected
 	default:
 		return FailureSendFailed
 	}
 }
 
-// FailureDetail is the prose that goes with a failure: what happened, and what to do about
-// it. None of these are retryable by the dispatcher — a message only reaches `failed` once
-// retrying has stopped.
+// FailureDetail is the prose that goes with a failure: what happened, and what to do about it.
 func FailureDetail(stored, to string) string {
 	switch FailureCode(stored) {
 	case FailureNotOnWhatsApp:

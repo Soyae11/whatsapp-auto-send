@@ -239,21 +239,32 @@ func (s *Store) MarkEventFailed(ctx context.Context, id string, statusCode *int,
 // admin CLI, so it says why rather than leaving an operator to guess.
 const DisabledWebhookReason = "webhook was disabled before this event could be delivered"
 
-// DeadLetterDisabledEvents retires pending events whose webhook has since been disabled, and
-// returns how many went. Without it those events are simply never looked at again: ClaimDueEvents
-// skips them, nothing else moves them, and they stay pending in the table for good. Dead is the
-// honest state for them, and the reversible one — dead events are what the events endpoint and the
-// admin CLI list, and ReplayEvent can put one back on the queue if the webhook is ever turned back
-// on. attempts is left alone, since no attempt was ever made.
-func (s *Store) DeadLetterDisabledEvents(ctx context.Context, at time.Time) (int64, error) {
+// DeadLetterDisabledEvents retires up to limit pending events whose webhook has since been
+// disabled, and returns how many went. Without it those events are never looked at again:
+// ClaimDueEvents skips them, nothing else moves them, and they stay pending for good. Dead is the
+// honest state and the reversible one — ReplayEvent can put one back if the webhook is turned
+// back on. attempts is left alone, since no attempt was ever made.
+//
+// Only events that are actually due are touched. A deliverer claiming an event pushes its
+// next_attempt_at a lease into the future, so that bound is what keeps this sweep from marking
+// dead an event another worker is mid-POST on — which MarkEventFailed would then flip back to
+// pending anyway, leaving the two to trade the row back and forth.
+func (s *Store) DeadLetterDisabledEvents(ctx context.Context, at time.Time, limit int) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE wa_webhook_events e
+		WITH doomed AS (
+			SELECT e.id
+			  FROM wa_webhook_events e
+			  JOIN wa_webhooks w ON w.id = e.webhook_id
+			 WHERE e.status = $4 AND e.next_attempt_at <= $3
+			   AND w.disabled_at IS NOT NULL
+			 ORDER BY e.next_attempt_at
+			 LIMIT $5
+			 FOR UPDATE OF e SKIP LOCKED
+		)
+		UPDATE wa_webhook_events
 		   SET status = $1, last_error = $2, next_attempt_at = $3
-		  FROM wa_webhooks w
-		 WHERE w.id = e.webhook_id
-		   AND e.status = $4
-		   AND w.disabled_at IS NOT NULL`,
-		EventDead, DisabledWebhookReason, at, EventPending)
+		 WHERE id IN (SELECT id FROM doomed)`,
+		EventDead, DisabledWebhookReason, at, EventPending, limit)
 	if err != nil {
 		return 0, fmt.Errorf("store: dead-letter events of disabled webhooks: %w", err)
 	}

@@ -9,22 +9,22 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"wa-shared/id"
 )
 
 // IdempotencyRetention is the minimum window over which a replayed key returns the original
 // response. Past it the same key is treated as a new request, which the contract documents.
 const IdempotencyRetention = 24 * time.Hour
 
-// IdempotencyInFlightTimeout caps how long a claim with no recorded response can keep answering
-// "still being processed". A request that claims a key and then dies before recording — the
-// process was killed mid-batch, or the database refused the write — would otherwise leave the key
-// unusable for the whole of IdempotencyRetention: no response to replay and no way to retry,
-// which is the worst of both. Past this window the claim is treated as abandoned and the next
-// request may take it over.
+// IdempotencyInFlightTimeout caps how long a claim with no recorded response keeps answering
+// "still being processed". A request that claims a key and then dies before recording would
+// otherwise leave the key unusable for all of IdempotencyRetention: no response to replay and no
+// way to retry. Past this window the claim is abandoned and the next request may take it over.
 //
-// It is set far longer than any single request should take, because the cost of being wrong runs
-// one way: too short and a slow batch's own retry could re-send its messages, while too long only
-// makes a caller wait to retry after a failure that is already rare.
+// It is far longer than any single request should take, because the cost of being wrong runs one
+// way: too short and a slow batch's own retry re-sends its messages, while too long only makes a
+// caller wait after a failure that is already rare.
 const IdempotencyInFlightTimeout = 5 * time.Minute
 
 // ErrIdempotencyConflict means the key was reused with a different request body. That is
@@ -34,6 +34,11 @@ var ErrIdempotencyConflict = errors.New("store: idempotency key reused with a di
 // ErrIdempotencyInFlight means a request under this key is still being processed. The claim
 // row exists but no response has been recorded against it yet.
 var ErrIdempotencyInFlight = errors.New("store: idempotency key is still in flight")
+
+// ErrIdempotencyClaimTaken means the claim this request held was taken over by another one after
+// IdempotencyInFlightTimeout, so the write was refused rather than allowed to overwrite the
+// taker's. It is a fact about who owns the key, not a failure of the work the caller just did.
+var ErrIdempotencyClaimTaken = errors.New("store: idempotency claim was taken over by a later request")
 
 type IdempotentResponse struct {
 	StatusCode int
@@ -48,19 +53,16 @@ func HashRequest(body []byte) string {
 }
 
 // ClaimIdempotencyKey takes ownership of a key for this request, or reports what the key is
-// already being used for. A recorded response comes back exactly as it was stored — see the
-// note on the response column in schema.sql.
+// already being used for.
 //
-// It returns a nil response when the caller has just claimed the key and should go on to do
-// the work. It returns a non-nil response when this is a replay and that response should be
-// returned verbatim. It returns ErrIdempotencyConflict when the stored hash differs, and
-// ErrIdempotencyInFlight when an earlier request holds the claim but has not finished.
+// A nil response means the caller just claimed the key and should do the work; the claim id it
+// gets back fences its later writes — see RecordIdempotentResponse. A non-nil response is a replay
+// and should be returned verbatim. ErrIdempotencyConflict means the stored hash differs;
+// ErrIdempotencyInFlight means an earlier request holds the claim and has not finished.
 //
-// "Has not finished" is bounded by IdempotencyInFlightTimeout: a claim past it that still carries
-// no response is taken to have been abandoned, and this call claims it afresh. A key whose
-// request died before recording is therefore usable again in minutes rather than being unusable
-// until the retention sweep. A recorded response is never taken over, at any age.
-func (s *Store) ClaimIdempotencyKey(ctx context.Context, apiKeyID, key, requestHash string) (*IdempotentResponse, error) {
+// "Has not finished" is bounded by IdempotencyInFlightTimeout — past it a claim carrying no
+// response is taken as abandoned and reclaimed here. A recorded response is never taken over.
+func (s *Store) ClaimIdempotencyKey(ctx context.Context, apiKeyID, key, requestHash string) (claimID string, replay *IdempotentResponse, err error) {
 	var (
 		claimed    bool
 		storedHash string
@@ -68,25 +70,33 @@ func (s *Store) ClaimIdempotencyKey(ctx context.Context, apiKeyID, key, requestH
 		body       []byte
 	)
 
-	// One statement so two concurrent requests under one key cannot both see it free. The
-	// insert wins for exactly one of them; the other falls through to the second branch and
-	// reads what is already stored. A data-modifying CTE is invisible to the rest of the
-	// query, so exactly one branch yields a row.
+	// Fresh per attempt, and stored by both branches of the upsert, so a takeover moves ownership
+	// of the row rather than sharing it: the request that was taken over still holds the previous
+	// id and every write it makes from here on matches nothing.
+	mine := id.New("clm")
+
+	// One statement so two concurrent requests under one key cannot both see it free. The insert
+	// wins for exactly one of them; the other falls through to the second branch and reads what
+	// is already stored.
 	//
 	// The DO UPDATE takes over a claim that was abandoned — no response recorded, and older than
 	// IdempotencyInFlightTimeout — which reads as a fresh claim from here on, since resetting
-	// created_at and request_hash is exactly what an insert would have left. Its WHERE is what
-	// keeps that narrow: a claim that is genuinely still running, or one that already carries a
-	// response, fails the condition, updates nothing, returns no row, and falls through to the
-	// second branch precisely as it did under DO NOTHING. Overwriting the hash means a key
-	// reclaimed this way no longer reports a conflict against the abandoned request's body,
-	// which is the intent — that request left no response for a mismatch to protect.
-	err := s.pool.QueryRow(ctx, `
+	// created_at and request_hash is what an insert would have left. Its WHERE keeps that narrow:
+	// a claim still running, or one already carrying a response, fails the condition and updates
+	// nothing. Overwriting the hash means a key reclaimed this way no longer conflicts against the
+	// abandoned request's body, which is the intent — it left no response for a mismatch to guard.
+	//
+	// NOT EXISTS is what makes the union unambiguous. On a takeover the pre-existing row is
+	// visible to the second branch as well (both read the same snapshot), so without it both
+	// branches yield a row and LIMIT 1 silently picks whichever the planner emits first — and the
+	// wrong pick reports ErrIdempotencyInFlight to the caller that actually holds the claim.
+	err = s.pool.QueryRow(ctx, `
 		WITH claim AS (
-			INSERT INTO wa_idempotency (api_key_id, key, request_hash)
-			VALUES ($1, $2, $3)
+			INSERT INTO wa_idempotency (api_key_id, key, request_hash, claim_id)
+			VALUES ($1, $2, $3, $5)
 			ON CONFLICT (api_key_id, key) DO UPDATE
 			   SET request_hash = EXCLUDED.request_hash,
+			       claim_id     = EXCLUDED.claim_id,
 			       created_at   = now()
 			 WHERE wa_idempotency.status_code IS NULL
 			   AND wa_idempotency.created_at < now() - $4::interval
@@ -97,46 +107,61 @@ func (s *Store) ClaimIdempotencyKey(ctx context.Context, apiKeyID, key, requestH
 		SELECT false, request_hash, status_code, response
 		  FROM wa_idempotency
 		 WHERE api_key_id = $1 AND key = $2
+		   AND NOT EXISTS (SELECT 1 FROM claim)
 		 LIMIT 1`,
-		apiKeyID, key, requestHash, IdempotencyInFlightTimeout.String()).Scan(&claimed, &storedHash, &statusCode, &body)
+		apiKeyID, key, requestHash, IdempotencyInFlightTimeout.String(), mine).Scan(&claimed, &storedHash, &statusCode, &body)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("store: claim idempotency key %s: the claim vanished between insert and read", key)
+		return "", nil, fmt.Errorf("store: claim idempotency key %s: the claim vanished between insert and read", key)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("store: claim idempotency key %s: %w", key, err)
+		return "", nil, fmt.Errorf("store: claim idempotency key %s: %w", key, err)
 	}
 
 	switch {
 	case storedHash != requestHash:
-		return nil, ErrIdempotencyConflict
+		return "", nil, ErrIdempotencyConflict
 	case claimed:
-		return nil, nil
+		return mine, nil, nil
 	case statusCode == nil:
-		return nil, ErrIdempotencyInFlight
+		return "", nil, ErrIdempotencyInFlight
 	}
-	return &IdempotentResponse{StatusCode: *statusCode, Body: body}, nil
+	return "", &IdempotentResponse{StatusCode: *statusCode, Body: body}, nil
 }
 
-// RecordIdempotentResponse stores the response a claimed key should replay from here on.
-func (s *Store) RecordIdempotentResponse(ctx context.Context, apiKeyID, key string, statusCode int, body []byte) error {
-	_, err := s.pool.Exec(ctx, `
+// RecordIdempotentResponse stores the response a claimed key should replay from here on, if this
+// request still holds the claim it was given.
+//
+// ErrIdempotencyClaimTaken means it does not: the request ran past IdempotencyInFlightTimeout and
+// a retry took the key over, re-did the work and answered its own caller. Recording anyway would
+// replace that caller's response — its message ids among them — with this one's. Nothing is
+// written, and the caller should answer normally: its own work is done, and the duplicate send the
+// takeover caused is the cost the timeout knowingly accepts.
+func (s *Store) RecordIdempotentResponse(ctx context.Context, apiKeyID, key, claimID string, statusCode int, body []byte) error {
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE wa_idempotency
-		   SET status_code = $3, response = $4
-		 WHERE api_key_id = $1 AND key = $2`,
-		apiKeyID, key, statusCode, body)
+		   SET status_code = $4, response = $5
+		 WHERE api_key_id = $1 AND key = $2 AND claim_id = $3`,
+		apiKeyID, key, claimID, statusCode, body)
 	if err != nil {
 		return fmt.Errorf("store: record idempotent response %s: %w", key, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: %s", ErrIdempotencyClaimTaken, key)
 	}
 	return nil
 }
 
 // ReleaseIdempotencyKey drops a claim whose work did not produce a replayable response, so a
 // caller retrying after a failure is not told its own key conflicts with itself.
-func (s *Store) ReleaseIdempotencyKey(ctx context.Context, apiKeyID, key string) error {
+//
+// Fenced by claimID for the same reason recording is, and here the unfenced version was the more
+// expensive one: a request whose claim had been taken over would delete the *taker's* in-flight
+// row, leaving the key free for a third request to claim and send a third copy of the message.
+func (s *Store) ReleaseIdempotencyKey(ctx context.Context, apiKeyID, key, claimID string) error {
 	_, err := s.pool.Exec(ctx, `
 		DELETE FROM wa_idempotency
-		 WHERE api_key_id = $1 AND key = $2 AND status_code IS NULL`,
-		apiKeyID, key)
+		 WHERE api_key_id = $1 AND key = $2 AND claim_id = $3 AND status_code IS NULL`,
+		apiKeyID, key, claimID)
 	if err != nil {
 		return fmt.Errorf("store: release idempotency key %s: %w", key, err)
 	}

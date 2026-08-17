@@ -24,6 +24,10 @@ var sessionFaults = []struct {
 	{CodeRateLimitedByWA, ErrRateLimited},
 	{CodeUnauthorized, ErrUnauthorized},
 	{CodeSendFailed, ErrSendFailed},
+	// WhatsApp took the message and then refused it, usually because the sending account is
+	// restricted. That indicts the account, so a pooled sender must rotate off this session —
+	// moving it to the request-fault list would silently stop rotation on a 463 rejection.
+	{CodeMessageRejected, ErrMessageRejected},
 	{CodeSendInProgress, ErrSendInProgress},
 	{CodeUpstreamTimeout, ErrUpstreamTimeout},
 	{CodeInternalError, ErrInternal},
