@@ -1,7 +1,0 @@
-go 1.25.0
-
-use (
-	./wa-consumer-api
-	./wa-dispatcher
-	./wa-shared
-)

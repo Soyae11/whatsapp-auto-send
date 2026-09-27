@@ -1,154 +1,114 @@
-# whatsapp-api
+# whatsapp-gateway
 
-Three projects that together let an internal app send WhatsApp messages to employees safely.
+A small HTTP gateway to WhatsApp, built on [Baileys](https://github.com/WhiskeySockets/Baileys).
+It keeps several WhatsApp numbers logged in, sends text messages from them, and pushes inbound
+messages and delivery receipts to a webhook.
 
-```
-                  wa-laravel (SDK)  →  wa-consumer-api  ┄┄►  wa-dispatcher  ═══►  gateway  →  WhatsApp
-                       ▲                (queue front door)     (paces sends)       (baileys)
-                       │                                                              ▲
-                 wa-console: Send                                          wa-console: Sessions
-              (single or batch, via a                                    (pair/logout/remove, via
-               sender-scoped key)                                       the console-scoped key)
+- **Multiple numbers** in one process
+- **Pairing** by QR (live SSE stream) or an 8-character phone code
+- **Persistent login**: auth state lives in Postgres, so a restart doesn't mean scanning the QR again
+- **Idempotent sends**: the same `idempotencyKey` never sends twice
+- **Auto-reconnect** with backoff. A logged-out number stops instead of retrying forever.
+- **Signed webhooks** for `message.received`, `message.status` and `session.status_changed`
+- **Health and Prometheus metrics**. A number is marked `unhealthy` after repeated send failures.
 
-═══►  sending. Only wa-dispatcher may do this, and only on its own schedule.
-┄┄►   queued — wa-consumer-api enqueues onto Redis, wa-dispatcher drains it.
-```
+It doesn't queue, schedule or retry. If you send in bulk, pace the sends yourself.
 
-The split is enforced, not agreed: baileys issues two scoped bearer tokens, and **the
-console-scoped token cannot send** — a send that skipped it would also skip the pacing
-that keeps a number from being banned. wa-console's own send feature goes through
-`wa-laravel` like any other caller, with a `wa-consumer-api` key scoped to specific senders —
-it has no shortcut into baileys. Queue operations (retry, cancel, pause/resume) still happen
-through wa-consumer-api's `/internal/*` admin routes directly.
-
-## Running it
-
-One compose file at the root runs the whole system. There are no per-project compose files.
+## Run it
 
 ```sh
-cp .env.example .env    # then fill in the secrets it lists at the top
+cp .env.example .env          # set API_KEY (openssl rand -hex 32)
 docker compose up -d --build
-curl -s localhost:8080/v1/health
+curl -s localhost:3000/health
 ```
 
-| Service | Where | What it is |
+On the host, with your own Postgres:
+
+```sh
+cp .env.example .env          # point DATABASE_URL at it
+npm install
+npm run dev                   # applies migrations on boot
+```
+
+| Command | What it does |
+|---|---|
+| `npm run dev` | Watch mode, reads `.env` |
+| `npm run build` / `npm start` | Compile to `dist/`, then run it |
+| `npm run migrate` | Apply `migrations/` only |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm test` | Unit tests; the DB-backed tests skip themselves without `DATABASE_URL` |
+| `npm run test:integration` | Every test, against `DATABASE_URL` |
+
+## Configuration
+
+| Variable | Required | |
 |---|---|---|
-| `gateway` | http://localhost:3000 | baileys — talks to WhatsApp |
-| `wa-consumer-api` | http://localhost:8080 | the queue's front door |
-| `wa-dispatcher` | — | drains the queue, one send at a time per number |
-| `wa-console` | http://localhost:8000 | operator console — session pairing/logout/removal, and sending. Runs on the host, not in compose |
-| `asynqmon` | http://localhost:8081 | queue UI |
-| `postgres` | `localhost:5433` | **shared** — one database each for baileys, dispatcher, console |
-| `redis` | `localhost:6380` | **shared** — queue and slot allocator |
+| `API_KEY` | yes | Bearer token for every route except `/health`, at least 16 characters |
+| `DATABASE_URL` | yes | Postgres connection string |
+| `PORT` | yes | HTTP port |
+| `LOG_LEVEL` | yes | `fatal` … `trace`, or `silent` |
+| `WEBHOOK_URL` | no | Where events are POSTed. Leave empty to turn webhooks off |
+| `WEBHOOK_SECRET` | with `WEBHOOK_URL` | HMAC key, at least 16 characters |
+| `WEBHOOK_TIMEOUT_MS` | no | Default `5000` |
 
-**One `.env`, at the root.** Secrets shared between services — the gateway API key, the
-admin key, the webhook secret — are defined once there instead of copied between projects,
-which is how they used to drift apart and produce a 401 that looked like a gateway bug. The
-`.env` inside each project is now only for running that project on the host (`npm run dev`,
-`go test`, `php artisan`); containers never read them.
+## API
 
-**One database server, three databases.** `baileys` owns `wa_sessions`/`wa_sent_messages`,
-`dispatcher` owns `wa_jobs`, `console` owns users and the audit log. Each has its own owner
-role, so no service can reach another's tables. `docker/postgres/init/01-databases.sh`
-creates them on first boot and never runs again.
+Every route except `/health` needs `Authorization: Bearer $API_KEY`. Errors look like
+`{ "error_code": "...", "message": "...", "retryable": true|false }`.
 
-**Build files live in `docker/`.** One Dockerfile per service, built against that project's
-directory as context. Only `.dockerignore` stays inside each project, because Docker reads
-it from the build-context root.
+| Method | Path | |
+|---|---|---|
+| `GET` | `/health` | DB reachability and uptime, no auth |
+| `GET` | `/metrics` | Prometheus text format |
+| `POST` | `/sessions` | `{ "label": "..." }` → new session with `status: "new"` |
+| `GET` | `/sessions` | All sessions with their live health |
+| `GET` | `/sessions/:id` | One session |
+| `POST` | `/sessions/:id/connect` | Open the socket. An unpaired session starts producing QR codes |
+| `GET` | `/sessions/:id/qr` | Current QR, if any |
+| `GET` | `/sessions/:id/qr/stream` | SSE events: `status`, `qr`, then `paired` or `failed` |
+| `POST` | `/sessions/:id/pair` | `{ "phoneNumber": "62812..." }` → `{ "pairingCode": "ABCD1234" }` |
+| `POST` | `/sessions/:id/send` | `{ "idempotencyKey", "to", "type": "text", "text" }` |
+| `POST` | `/sessions/:id/restart` | Reconnect the socket |
+| `POST` | `/sessions/:id/logout` | Log the number out |
+| `POST` | `/sessions/:id/reset` | Wipe auth so the session can be paired again |
+| `DELETE` | `/sessions/:id` | Remove the session and its auth |
 
-**The Go services live under `go-consumer/`.** `wa-consumer-api`, `wa-dispatcher`, and the
-`wa-shared` module they both depend on (via a `go.work` workspace) are grouped together at
-`go-consumer/wa-consumer-api`, `go-consumer/wa-dispatcher`, and `go-consumer/wa-shared`.
+### Pair a number and send
 
----
+```sh
+H="Authorization: Bearer $API_KEY"
+ID=$(curl -s -H "$H" -H 'content-type: application/json' \
+       -d '{"label":"main"}' localhost:3000/sessions | jq -r .id)
 
-## `baileys/` — the thing that actually talks to WhatsApp
+# Either scan the QR…
+curl -s -X POST -H "$H" localhost:3000/sessions/$ID/connect
+curl -N -H "$H" localhost:3000/sessions/$ID/qr/stream
 
-*Node + TypeScript, Fastify, Postgres*
+# …or enter a code on the phone (WhatsApp → Linked devices → Link with phone number)
+curl -s -H "$H" -H 'content-type: application/json' \
+     -d '{"phoneNumber":"6281234567890"}' localhost:3000/sessions/$ID/pair
 
-- **Multi-number** — connect several WhatsApp accounts at once in one service
-- **QR + code pairing** — log in by scanning a QR or typing an 8-digit code on your phone
-- **Send messages** — one HTTP call sends a message from a chosen number
-- **Duplicate protection** — an idempotency key means the same message never goes out twice
-- **Persistent login** — credentials live in Postgres, so restarts never cost a re-scan
-- **Auto-reconnect** — drops are retried with backoff; a logged-out number stops instead of looping
-- **Webhooks** — pushes inbound messages, delivery receipts, and status changes to your app, signed
-- **Health + metrics** — per-number health plus Prometheus stats; flags a number as unhealthy after repeated failures
+curl -s -H "$H" -H 'content-type: application/json' \
+     -d '{"idempotencyKey":"order-42","to":"6281234567890","type":"text","text":"Hello"}' \
+     localhost:3000/sessions/$ID/send
+```
 
-**In one line:** it's the phone — it sends and receives, nothing else. No queueing, scheduling, or retrying.
+## Webhooks
 
-⚠️ Run exactly one copy. A WhatsApp session can only live in one process.
+Each event is POSTed as JSON with these headers:
 
----
+- `x-baileys-event`: the event type
+- `x-baileys-timestamp`: milliseconds since the epoch
+- `x-baileys-signature`: `sha256=` + hex HMAC-SHA256 of `` `${timestamp}.${rawBody}` `` keyed with `WEBHOOK_SECRET`
 
-## `go-consumer/wa-consumer-api/` — the queue's front door
+To verify an event, recompute the signature over the raw body and compare the two in constant
+time. Reject anything with an old timestamp. A delivery is attempted once, with no retries,
+so a slow consumer never holds up message handling.
 
-*Go, Redis (Asynq), Postgres*
+## Things to know
 
-- **Send messages** — one call queues a send (`POST /v1/messages`)
-- **Batch sending** — up to 100 messages in one request
-- **Coalescing** — several messages to the same person within a short window merge into one, at enqueue time
-- **Forced idempotency** — a key is required to send; expired keys are purged hourly
-- **Message tracking** — list/filter by sender, recipient, status, or reference, or look up any message's status, timeline, attempts, and last error
-- **Cancel** — pull a still-queued message before it sends
-- **Dry run** — validate a real send that never reaches a phone
-- **Operator/admin API** (`/internal/*`) — inspect jobs, retry, cancel, pause/resume a number's queue, replay webhooks, inspect a session's circuit state
-- **Delivery receipts in** — takes baileys' webhook events and turns them into its own webhook events out. Includes WhatsApp rejecting a message *after* accepting it (error 463, an unestablished-contact restriction) — the one case where `sent` would otherwise be a lie, since the gateway's own `/send` response had already returned success before the rejection arrived
-- **API keys** — every request scoped to a key, senders included; provision one with
-  `make create-key NAME=... PROJECT=... SENDERS=...` (`cmd/keys`)
-- **Health endpoint** — reports gateway, database, and Redis reachability in one call
+**Run one replica.** A WhatsApp session belongs to one process. Two processes that load the
+same auth state corrupt it.
 
-**In one line:** everything you send goes in here; it enqueues onto Redis and gets out of the way.
-
----
-
-## `go-consumer/wa-dispatcher/` — the thing that decides *when* to send
-
-*Go, Redis (Asynq), Postgres*
-
-- **Pure background worker** — no HTTP port, drains the queue `wa-consumer-api` fills
-- **Pacing** — spaces sends out so WhatsApp doesn't ban the number
-- **One at a time per number** — a single asynq server per session at concurrency 1; never two sends in flight on the same account, ever
-- **Priority lanes** — critical (OTPs) jumps the queue, bulk (digests) waits its turn, weighted 6:3:1
-- **Automatic retries** — backoff tuned per failure reason, capped and jittered; hopeless ones stop immediately
-- **Circuit breaker** — a sick session's queue pauses itself and resumes when it recovers, without being tripped by one bad recipient
-- **Webhooks out** — delivers them itself, so a slow or dead webhook endpoint never adds latency to a send
-
-**In one line:** the traffic controller — drains the queue one send at a time per number, on schedule.
-
----
-
-## `wa-laravel/` — the SDK your Laravel app installs
-
-*PHP package (`wa/laravel`)*
-
-- **Fluent sending** — `Wa::to(...)->text(...)->send()`, one line to queue a message
-- **Notification channel** — send WhatsApp straight from a Laravel notification
-- **Forced idempotency** — refuses to send without a key, so a retried job can't message someone twice
-- **Typed exceptions** — one exception class per failure reason instead of parsing JSON
-- **Priorities** — `->critical()` and `->bulk()` map to wa-dispatcher's lanes
-- **Safe by default** — everything is a dry run outside production
-- **Read back** — find a message, list/filter by your own reference, cancel, check sender health
-- **Webhook handling** — signature verification plus events for sent / delivered / read / failed
-- **Testing** — `Wa::fake()` so tests assert messages without hitting the network
-
-**In one line:** ergonomics over the wa-consumer-api — nothing here that the raw API can't do.
-
----
-
-## `wa-console/` — the operator console
-
-*Laravel 13, Inertia + React*
-
-- **Pair by QR** — scan a code from WhatsApp's Linked Devices screen (polled, not live-streamed)
-- **Pair by code** — type an 8-character code on the phone instead of scanning
-- **Logout** — un-pairs the device
-- **Remove** — deletes the session from baileys' database entirely, not just its credentials
-- **Send** — single or batch, through `wa-laravel`; results (accepted/rejected) render per number
-- **Messages** — search/filter by sender, recipient, status, or reference; inspect any
-  message's full timeline and, when WhatsApp rejected it after accepting it, why
-
-**In one line:** a thin, authenticated UI over baileys' session API and `wa-laravel` — it holds
-no session data of its own, and its session-management credential can never send (sending goes
-through a separate, sender-scoped `wa-consumer-api` key). Runs on the host (`composer run dev`),
-not in Docker — see [`wa-console/README.md`](wa-console/README.md).
+**Baileys is pinned to an exact version** (`7.0.0-rc14`). It's pre-1.0 and its protocol code
+changes between releases, so only upgrade it on purpose.
